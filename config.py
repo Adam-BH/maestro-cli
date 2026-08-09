@@ -1,0 +1,92 @@
+"""
+Central configuration for AgentOrchestrator.
+
+Nothing here talks to the network or the filesystem beyond reading env vars;
+it just defines defaults that `orchestrator/main.py` wires into the rest of
+the app (and that CLI flags can override at runtime).
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# agents/prompts/*.md ships alongside this file inside the AgentOrchestrator
+# install — it must be found there regardless of which target repo the
+# orchestrator is run against (STRATEGY.md, logs/, etc. are relative to
+# *that* repo's cwd instead; see strategy_path/log_dir below).
+_PACKAGE_ROOT = Path(__file__).resolve().parent
+
+
+@dataclass
+class AgentToolConfig:
+    """Per-agent tool scoping and turn budget passed straight to `claude -p`."""
+
+    allowed_tools: str
+    max_turns: int
+    permission_mode: str = "acceptEdits"
+
+
+@dataclass
+class Config:
+    # Model used for every `claude -p` invocation. Override with
+    # AGENTORCH_MODEL if you want a cheaper/faster model for iteration.
+    model: str = field(default_factory=lambda: os.environ.get("AGENTORCH_MODEL", "sonnet"))
+
+    # How many times Coder may retry a single task after a Reviewer REJECT
+    # before the loop escalates to NEEDS_HUMAN itself.
+    max_task_retries: int = 3
+
+    # Hard ceiling on total plan -> code -> review cycles across the whole
+    # run, independent of per-task retries. Exists purely so a pathological
+    # plan (or a Planner stuck re-planning) can't loop forever.
+    max_total_iterations: int = 100
+
+    # Commit after every accepted Coder attempt, not just after Reviewer
+    # approval. Useful for forensic history; off by default to keep the
+    # git log readable (one commit per approved task).
+    commit_every_attempt: bool = False
+
+    # Run each agent with `claude -p --bare` (skips hooks/CLAUDE.md/MCP
+    # config for reproducibility). NOTE: --bare only supports
+    # ANTHROPIC_API_KEY auth (OAuth/keychain are never read in bare mode) —
+    # ClaudeClient auto-disables it when no API key is set, so OAuth/
+    # subscription logins keep working. Set False to always use normal auth.
+    bare: bool = True
+
+    # Where per-call JSON logs go (timestamped, one file per agent call).
+    log_dir: str = "logs"
+
+    # Path to the strategy file that acts as the loop's persistent state.
+    # Relative to the target repo's cwd (the project being worked on).
+    strategy_path: str = "STRATEGY.md"
+
+    # Directory holding agents/prompts/*.md. Absolute, and anchored to this
+    # install rather than the target repo's cwd — see _PACKAGE_ROOT above.
+    prompts_dir: str = str(_PACKAGE_ROOT / "agents" / "prompts")
+
+    # Turn budget for the one-shot mission-cleanup pass at intake (no
+    # tools, pure text tidy-up — kept tiny on purpose).
+    mission_cleaner_max_turns: int = 3
+
+    agents: dict = field(
+        default_factory=lambda: {
+            "planner": AgentToolConfig(
+                allowed_tools="Read,Glob,Grep,Bash(git *)",
+                max_turns=15,
+            ),
+            "coder": AgentToolConfig(
+                allowed_tools="Read,Edit,Write,Glob,Grep,Bash",
+                max_turns=25,
+            ),
+            "reviewer": AgentToolConfig(
+                allowed_tools="Read,Glob,Grep,Bash(pytest *),Bash(python -m pytest*),"
+                "Bash(npm test*),Bash(npm run test*),Bash(go test*),Bash(git *)",
+                max_turns=15,
+            ),
+        }
+    )
+
+
+DEFAULT_CONFIG = Config()

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/
+STRATEGY.md
+*.egg-info/
+.claude/
