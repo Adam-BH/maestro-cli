@@ -93,5 +93,11 @@ class Agent:
             "duration_ms": result.duration_ms,
             "exit_code": result.exit_code,
             "raw_stderr": result.raw_stderr[-4000:] if result.raw_stderr else "",
+            # Only kept on failure — on success result_text/cost/turns above
+            # already capture everything useful, and successful stdout can be
+            # large. On failure this is often the *only* place to see what
+            # the CLI actually printed before dying (e.g. a crash that never
+            # reached a final JSON result — see claude_client._run_streaming).
+            "raw_stdout": (result.raw_stdout[-4000:] if result.raw_stdout else "") if not result.ok else "",
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

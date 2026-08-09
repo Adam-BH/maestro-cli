@@ -108,7 +108,10 @@ class Loop:
 
     @staticmethod
     def _rate_limit_text(result: ClaudeResult) -> Optional[str]:
-        combined = " ".join(filter(None, [result.error_message, result.result_text]))
+        # error_message/result_text are usually enough, but a hard process
+        # crash (exit 1, no JSON ever printed) can leave both empty with
+        # the only hint sitting in stderr — check that too rather than miss it.
+        combined = " ".join(filter(None, [result.error_message, result.result_text, result.raw_stderr]))
         return combined if is_rate_limited(combined) else None
 
     def _pause_for_rate_limit(self, agent_name: str, detail: str) -> None:
@@ -129,35 +132,51 @@ class Loop:
     # -- planning --------------------------------------------------
 
     def plan_step(self, revising: bool = False) -> str:
-        """Returns 'ok', 'rate_limited', or 'failed'."""
-        self.ui.set_agent("planner", "revising plan" if revising else "planning")
-        context = AgentContext(
-            strategy_text=self.strategy.render(), cwd=self.cwd, extra={"revising": revising}
-        )
-        result = self.planner.run(context, on_event=self._event_logger("planner"))
-        self.ui.record_call(result.cost_usd, result.num_turns)
+        """Returns 'ok', 'rate_limited', or 'failed'. Retries an
+        invocation-level failure or unparseable output up to
+        config.max_task_retries before giving up — same reasoning as
+        run_task_cycle: a single CLI hiccup shouldn't be able to sink an
+        entire run before it even starts."""
+        result = None
+        tasks = []
+        attempt = 0
 
-        if not result.ok:
-            rl = self._rate_limit_text(result)
-            if rl:
-                self._pause_for_rate_limit("planner", rl)
-                return "rate_limited"
+        while True:
+            attempt += 1
+            self.ui.set_agent("planner", f"revising plan (attempt {attempt})" if revising else f"planning (attempt {attempt})")
+            context = AgentContext(
+                strategy_text=self.strategy.render(), cwd=self.cwd, extra={"revising": revising}
+            )
+            result = self.planner.run(context, on_event=self._event_logger("planner"))
+            self.ui.record_call(result.cost_usd, result.num_turns)
 
-            self.ui.log("planner", f"ERROR: {result.error_message}")
-            self.strategy.add_log("planner", f"ERROR: {result.error_message}")
-            self.strategy.run_status = "blocked"
-            self.ui.clear_agent()
-            self.ui.print_needs_human("(planning)", f"Planner invocation failed: {result.error_message}")
-            return "failed"
+            if not result.ok:
+                rl = self._rate_limit_text(result)
+                if rl:
+                    self._pause_for_rate_limit("planner", rl)
+                    return "rate_limited"
 
-        tasks = parse_plan(result.result_text)
-        if not tasks:
-            self.ui.log("planner", "ERROR: no parseable plan in output")
-            self.strategy.add_log("planner", "ERROR: Planner did not return a parseable PLAN block.")
-            self.strategy.run_status = "blocked"
-            self.ui.clear_agent()
-            self.ui.print_needs_human("(planning)", "Planner did not return a parseable plan.")
-            return "failed"
+                self.ui.log("planner", f"ERROR: {result.error_message}")
+                self.strategy.add_log("planner", f"attempt {attempt}: invocation error: {result.error_message}")
+                if attempt >= self.config.max_task_retries:
+                    self.strategy.run_status = "blocked"
+                    self.ui.clear_agent()
+                    self.ui.print_needs_human("(planning)", f"Planner invocation failed: {result.error_message}")
+                    return "failed"
+                continue
+
+            tasks = parse_plan(result.result_text)
+            if not tasks:
+                self.ui.log("planner", "ERROR: no parseable plan in output")
+                self.strategy.add_log("planner", f"attempt {attempt}: no parseable PLAN block.")
+                if attempt >= self.config.max_task_retries:
+                    self.strategy.run_status = "blocked"
+                    self.ui.clear_agent()
+                    self.ui.print_needs_human("(planning)", "Planner did not return a parseable plan.")
+                    return "failed"
+                continue
+
+            break
 
         # Preserve completed/in-flight task state when revising by title match;
         # otherwise this is a fresh plan.
@@ -178,10 +197,33 @@ class Loop:
 
     # -- one task's code/review cycle -------------------------------
 
+    def _retry_or_escalate(self, task: Task, reason: str) -> Optional[Tuple[str, str]]:
+        """Mark `task` rejected with `reason`. If retries are exhausted,
+        marks it needs_human instead and returns the (outcome, reason) pair
+        to return from run_task_cycle. Returns None if the caller should
+        retry (loop again) — used uniformly for REJECT verdicts, invocation
+        failures, and unparseable output, so a single transient CLI hiccup
+        gets the same chance to recover as a real REJECT does, instead of
+        being escalated to a human on the very first failure."""
+        task.status = "rejected"
+        task.notes = reason
+        if task.attempts >= self.config.max_task_retries:
+            task.status = "needs_human"
+            escalated = (
+                f"Exceeded max retries ({self.config.max_task_retries}) on {task.id}. "
+                f"Last error: {reason}"
+            )
+            task.notes = escalated
+            return OUTCOME_NEEDS_HUMAN, escalated
+        return None
+
     def run_task_cycle(self, task: Task) -> Tuple[str, str]:
-        """Drive one task through Coder -> Reviewer, retrying on REJECT up
-        to config.max_task_retries. Returns (outcome, reason) where outcome
-        is OUTCOME_APPROVED, OUTCOME_NEEDS_HUMAN, or OUTCOME_RATE_LIMITED."""
+        """Drive one task through Coder -> Reviewer, retrying on REJECT *or*
+        on an invocation-level failure (subprocess crash, unparseable
+        output — plausibly transient, not necessarily a real problem with
+        the task) up to config.max_task_retries. Returns (outcome, reason)
+        where outcome is OUTCOME_APPROVED, OUTCOME_NEEDS_HUMAN, or
+        OUTCOME_RATE_LIMITED."""
 
         last_rejection: Optional[str] = task.notes if task.status == "rejected" else None
 
@@ -209,9 +251,11 @@ class Loop:
                     return OUTCOME_RATE_LIMITED, rl
                 self.ui.log("coder", f"ERROR: {coder_result.error_message}")
                 self.strategy.add_log("coder", f"{task.id}: invocation error: {coder_result.error_message}")
-                task.status = "needs_human"
-                task.notes = f"Coder invocation failed: {coder_result.error_message}"
-                return OUTCOME_NEEDS_HUMAN, task.notes
+                escalation = self._retry_or_escalate(task, f"Coder invocation failed: {coder_result.error_message}")
+                if escalation:
+                    return escalation
+                last_rejection = task.notes
+                continue
 
             coder_outcome = parse_coder_result(coder_result.result_text)
             summary = coder_outcome.summary if coder_outcome else (coder_result.result_text or "")[-500:]
@@ -243,18 +287,22 @@ class Loop:
                     return OUTCOME_RATE_LIMITED, rl
                 self.ui.log("reviewer", f"ERROR: {review_result.error_message}")
                 self.strategy.add_log("reviewer", f"{task.id}: invocation error: {review_result.error_message}")
-                task.status = "needs_human"
-                task.notes = f"Reviewer invocation failed: {review_result.error_message}"
-                return OUTCOME_NEEDS_HUMAN, task.notes
+                escalation = self._retry_or_escalate(task, f"Reviewer invocation failed: {review_result.error_message}")
+                if escalation:
+                    return escalation
+                last_rejection = task.notes
+                continue
 
             verdict = parse_verdict(review_result.result_text)
             if verdict is None:
                 self.ui.log("reviewer", "ERROR: no parseable verdict")
                 self.strategy.add_log("reviewer", f"{task.id}: no parseable VERDICT in output.")
                 self.ui.clear_agent()
-                task.status = "needs_human"
-                task.notes = "Reviewer did not return a parseable verdict."
-                return OUTCOME_NEEDS_HUMAN, task.notes
+                escalation = self._retry_or_escalate(task, "Reviewer did not return a parseable verdict.")
+                if escalation:
+                    return escalation
+                last_rejection = task.notes
+                continue
 
             verdict_line = verdict.kind + (f": {verdict.reason}" if verdict.reason else "")
             self.ui.log("reviewer", verdict_line)
@@ -275,17 +323,10 @@ class Loop:
                 return OUTCOME_NEEDS_HUMAN, verdict.reason
 
             # REJECT
-            task.status = "rejected"
-            task.notes = verdict.reason
-            last_rejection = verdict.reason
-            if task.attempts >= self.config.max_task_retries:
-                task.status = "needs_human"
-                reason = (
-                    f"Exceeded max retries ({self.config.max_task_retries}) on {task.id}. "
-                    f"Last rejection: {verdict.reason}"
-                )
-                task.notes = reason
-                return OUTCOME_NEEDS_HUMAN, reason
+            escalation = self._retry_or_escalate(task, verdict.reason)
+            if escalation:
+                return escalation
+            last_rejection = task.notes
             # else: loop again, Coder gets last_rejection as context
 
     # -- top-level run loop ------------------------------------------

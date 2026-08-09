@@ -28,9 +28,11 @@ class Coder(Agent):
 
         if rejection_reason:
             parts.append(
-                f"\nThis task was previously attempted and REJECTED by the "
-                f"Reviewer for this reason:\n\n{rejection_reason}\n\n"
-                "Fix that specific problem."
+                f"\nThe previous attempt at this task did not succeed, for this "
+                f"reason:\n\n{rejection_reason}\n\n"
+                "If that describes a problem with the code, fix it. If it "
+                "describes a tooling/invocation failure unrelated to your code, "
+                "just retry the task normally."
             )
 
         parts.append(
