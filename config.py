@@ -89,8 +89,17 @@ class Config:
                 max_turns=25,
             ),
             "reviewer": AgentToolConfig(
-                allowed_tools="Read,Glob,Grep,Bash(pytest *),Bash(python -m pytest*),"
-                "Bash(npm test*),Bash(npm run test*),Bash(go test*),Bash(git *)",
+                # Broad enough to actually boot/exercise a project that has
+                # no formal test suite yet (early-stage tasks), not just run
+                # `test` scripts. Still excludes Edit/Write — the reviewer
+                # verifies, it never fixes.
+                allowed_tools="Read,Glob,Grep,"
+                "Bash(pytest *),Bash(python -m pytest*),Bash(python3 -m pytest*),"
+                "Bash(npm test*),Bash(npm run test*),Bash(npm install*),Bash(npm ci*),Bash(npm run *),"
+                "Bash(node *),Bash(npx *),Bash(python *),Bash(python3 *),"
+                "Bash(go test*),Bash(go run*),Bash(go build*),"
+                "Bash(curl *),Bash(sqlite3 *),Bash(cat *),Bash(ls *),"
+                "Bash(ps *),Bash(kill *),Bash(sleep *),Bash(timeout *),Bash(git *)",
                 max_turns=15,
             ),
         }
