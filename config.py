@@ -89,17 +89,18 @@ class Config:
                 max_turns=25,
             ),
             "reviewer": AgentToolConfig(
-                # Broad enough to actually boot/exercise a project that has
-                # no formal test suite yet (early-stage tasks), not just run
-                # `test` scripts. Still excludes Edit/Write — the reviewer
-                # verifies, it never fixes.
-                allowed_tools="Read,Glob,Grep,"
-                "Bash(pytest *),Bash(python -m pytest*),Bash(python3 -m pytest*),"
-                "Bash(npm test*),Bash(npm run test*),Bash(npm install*),Bash(npm ci*),Bash(npm run *),"
-                "Bash(node *),Bash(npx *),Bash(python *),Bash(python3 *),"
-                "Bash(go test*),Bash(go run*),Bash(go build*),"
-                "Bash(curl *),Bash(sqlite3 *),Bash(cat *),Bash(ls *),"
-                "Bash(ps *),Bash(kill *),Bash(sleep *),Bash(timeout *),Bash(git *)",
+                # Plain Bash, same as coder/tester: a prefix allowlist
+                # (Bash(node *), Bash(npm test*), ...) looks safer but isn't
+                # — it breaks on anything the allowlist author didn't
+                # anticipate (env-var prefixes like `PORT=3457 node ...`,
+                # commands chained with && / ;, etc.), which in practice
+                # meant the reviewer couldn't verify projects that don't
+                # have a test suite yet and burned its turn budget retrying
+                # denied variations instead of ever reaching a verdict.
+                # Edit/Write are still withheld — that's the actual
+                # verifies-never-fixes boundary — enforced structurally
+                # here, not just requested in the prompt.
+                allowed_tools="Read,Glob,Grep,Bash",
                 max_turns=15,
             ),
         }
