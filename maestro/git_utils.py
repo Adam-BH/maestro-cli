@@ -1,7 +1,7 @@
 """
 Small helpers around the git CLI: clean-tree checks, commits, and diff
-summaries. Deliberately not a git library binding — the orchestrator only
-needs a handful of plumbing commands and shelling out keeps the dependency
+summaries. Deliberately not a git library binding — Maestro only needs a
+handful of plumbing commands and shelling out keeps the dependency
 footprint small.
 """
 
@@ -48,7 +48,7 @@ def short_status(cwd: Optional[str] = None) -> str:
     return proc.stdout.strip()
 
 
-def stash(cwd: Optional[str] = None, message: str = "AgentOrchestrator autostash") -> bool:
+def stash(cwd: Optional[str] = None, message: str = "Maestro autostash") -> bool:
     proc = _run(["stash", "push", "-u", "-m", message], cwd=cwd, check=False)
     return proc.returncode == 0
 

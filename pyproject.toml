@@ -1,21 +1,21 @@
 [project]
-name = "agent-orchestrator"
+name = "maestro"
 version = "0.1.0"
-description = "Orchestrates Planner/Coder/Reviewer Claude Code agents in a plan -> build -> review loop."
+description = "Orchestrates Planner/Coder/Researcher/Tester/Reviewer Claude Code agents in a plan -> build -> review loop."
 requires-python = ">=3.9"
 dependencies = [
     "rich>=13.7",
 ]
 
 [project.scripts]
-agent-orchestrator = "orchestrator.main:main"
+maestro = "maestro.main:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["orchestrator", "orchestrator.ui", "agents"]
+packages = ["maestro", "maestro.ui", "agents"]
 py-modules = ["config"]
 
 [tool.setuptools.package-data]

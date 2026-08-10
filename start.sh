@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Sets up (or reuses) a local venv, makes sure deps are installed, then
-# always launches AgentOrchestrator through that venv's Python — never the
+# always launches Maestro through that venv's Python — never the
 # system one. Safe to re-run any time; every step is idempotent.
 set -euo pipefail
 
@@ -38,9 +38,9 @@ echo "==> Ensuring dependencies are installed (requirements.txt)..."
 "$VENV_PIP" install -q -r requirements.txt
 
 if ! command -v claude >/dev/null 2>&1; then
-    echo "warning: 'claude' CLI not found on PATH. AgentOrchestrator needs it" >&2
+    echo "warning: 'claude' CLI not found on PATH. Maestro needs it" >&2
     echo "  to run agents — install Claude Code first: https://docs.claude.com/claude-code" >&2
 fi
 
-echo "==> Starting AgentOrchestrator..."
-exec "$VENV_PY" -m orchestrator.main "$@"
+echo "==> Starting Maestro..."
+exec "$VENV_PY" -m maestro.main "$@"
