@@ -385,6 +385,23 @@ def main(argv=None) -> int:
                           f"({strategy.progress()[0]}/{strategy.progress()[1]} tasks done, "
                           f"iteration {strategy.iteration}, status={strategy.run_status}).")
 
+        # status == "in_progress" only means something *while* a Loop is
+        # actively driving that task. On --resume that Loop is gone by
+        # definition (a crash, Ctrl-C, or a kill), so any task still marked
+        # in_progress was interrupted before it reached a checkpointed state
+        # (pending_review, rejected, or done) — reset it so it isn't
+        # silently skipped forever by next_pending_task().
+        stuck = [t for t in strategy.tasks if t.status == "in_progress"]
+        for t in stuck:
+            t.status = "pending"
+        if stuck:
+            strategy.add_log(
+                "system",
+                f"--resume: {len(stuck)} task(s) were stuck in_progress from an "
+                f"interrupted run ({', '.join(t.id for t in stuck)}); reset to pending.",
+            )
+            ui.console.print(f"[cyan]Reset {len(stuck)} interrupted task(s) back to pending.[/cyan]")
+
         if args.retry_blocked:
             blocked = strategy.blocked_tasks()
             for t in blocked:

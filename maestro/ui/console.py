@@ -73,6 +73,7 @@ AGENT_COLORS = {
 STATUS_ICON = {
     "pending": "○",
     "in_progress": "◐",
+    "pending_review": "◑",
     "done": "●",
     "rejected": "✗",
     "needs_human": "⚠",
@@ -81,6 +82,7 @@ STATUS_ICON = {
 STATUS_STYLE = {
     "done": "green",
     "in_progress": "yellow",
+    "pending_review": "yellow",
     "rejected": "red",
     "needs_human": "bold red",
     "pending": "dim",

@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-TASK_STATUSES = ("pending", "in_progress", "done", "rejected", "needs_human")
+TASK_STATUSES = ("pending", "in_progress", "pending_review", "done", "rejected", "needs_human")
 RUN_STATUSES = (
     "planning",
     "in_progress",
@@ -49,6 +49,17 @@ class Task:
     # | "tester". Defaults to "coder" so STRATEGY.md files written before
     # this field existed still parse and run exactly as before.
     agent: str = "coder"
+    # How many times the Reviewer step itself has failed to reach a verdict
+    # (invocation error / unparseable output) for the *current* producer
+    # attempt. Tracked separately from `attempts` so a flaky reviewer call
+    # doesn't burn the Coder's retry budget or trigger a needless recode —
+    # see Loop._retry_review_or_escalate.
+    review_attempts: int = 0
+    # The producer's summary of its most recent attempt, kept around so a
+    # status == "pending_review" task can go straight back to the Reviewer
+    # (on the next loop iteration, or after --resume) without re-running the
+    # producer. Cleared once the task leaves pending_review.
+    last_producer_summary: str = ""
 
     def is_done(self) -> bool:
         return self.status == "done"
@@ -89,7 +100,7 @@ class Strategy:
 
     def next_pending_task(self) -> Optional[Task]:
         for t in self.tasks:
-            if t.status in ("pending", "rejected"):
+            if t.status in ("pending", "rejected", "pending_review"):
                 return t
         return None
 
@@ -140,6 +151,7 @@ class Strategy:
             lines.append(f"### Task {t.id}: {t.title}")
             lines.append(f"- status: {t.status}")
             lines.append(f"- attempts: {t.attempts}")
+            lines.append(f"- review_attempts: {t.review_attempts}")
             lines.append(f"- agent: {t.agent}")
             if t.acceptance_criteria:
                 lines.append("- acceptance_criteria:")
@@ -149,6 +161,8 @@ class Strategy:
                 lines.append("- acceptance_criteria: (none specified)")
             if t.notes:
                 lines.append(f"- notes: {t.notes}")
+            if t.last_producer_summary:
+                lines.append(f"- last_producer_summary: {t.last_producer_summary}")
             lines.append("")
 
         lines += ["## Decision Log", ""]
@@ -228,6 +242,10 @@ class Strategy:
                 if attempts_m:
                     task.attempts = int(attempts_m.group(1))
 
+                review_attempts_m = re.search(r"^- review_attempts: (\d+)$", body, re.M)
+                if review_attempts_m:
+                    task.review_attempts = int(review_attempts_m.group(1))
+
                 agent_m = re.search(r"^- agent: (.+)$", body, re.M)
                 if agent_m:
                     task.agent = agent_m.group(1).strip()
@@ -235,6 +253,10 @@ class Strategy:
                 notes_m = re.search(r"^- notes: (.+)$", body, re.M)
                 if notes_m:
                     task.notes = notes_m.group(1).strip()
+
+                summary_m = re.search(r"^- last_producer_summary: (.+)$", body, re.M)
+                if summary_m:
+                    task.last_producer_summary = summary_m.group(1).strip()
 
                 ac_m = re.search(
                     r"^- acceptance_criteria:\s*\n((?:^  - .+\n?)+)", body, re.M
