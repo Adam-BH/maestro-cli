@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from agents.base import Agent, AgentContext
-from orchestrator.strategy import Task
+from maestro.strategy import Task
 
 VERDICT_APPROVE = "APPROVE"
 VERDICT_REJECT = "REJECT"
@@ -37,6 +37,20 @@ class Reviewer(Agent):
             "run relevant tests, and output your verdict as specified in your "
             "instructions."
         )
+
+        if context.constraints:
+            parts.append("\nHard constraints for this run (verify these weren't violated):")
+            for c in context.constraints:
+                parts.append(f"- {c}")
+
+        if context.extra.get("no_commit"):
+            parts.append(
+                "\nNOTE: this run has a NO-COMMIT constraint, so the Coder's changes "
+                "will NOT be committed. Inspect the uncommitted working tree "
+                "(`git status`, `git diff`) instead of commit history (`git show`, "
+                "`git log -p`) — do not reject a task merely for being uncommitted."
+            )
+
         return "\n".join(parts)
 
 

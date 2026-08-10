@@ -6,7 +6,7 @@ import re
 from typing import List
 
 from agents.base import Agent, AgentContext
-from orchestrator.strategy import Task
+from maestro.strategy import Task
 
 
 class Planner(Agent):
@@ -22,12 +22,16 @@ class Planner(Agent):
             if revising
             else "Produce the initial task plan for the mission below."
         )
-        return (
+        prompt = (
             f"{header}\n\n"
             f"Current STRATEGY.md:\n\n```markdown\n{context.strategy_text}\n```\n\n"
             "Investigate the repository as needed, then output the plan block "
             "as specified in your instructions."
         )
+        if context.constraints:
+            prompt += "\n\nHard constraints for this run (must not be violated):\n"
+            prompt += "\n".join(f"- {c}" for c in context.constraints)
+        return prompt
 
 
 def parse_plan(text: str) -> List[Task]:
@@ -51,11 +55,18 @@ def parse_plan(text: str) -> List[Task]:
                 for line in ac_match.group(1).splitlines()
                 if line.strip().startswith("-")
             ]
+
+        agent_m = re.search(r"^\s*-\s*agent:\s*(\w+)", body, re.M)
+        agent_role = agent_m.group(1).strip().lower() if agent_m else "coder"
+        if agent_role not in ("coder", "researcher", "tester"):
+            agent_role = "coder"
+
         tasks.append(
             Task(
                 id=f"task-{task_id.strip()}",
                 title=title.strip(),
                 acceptance_criteria=criteria,
+                agent=agent_role,
             )
         )
     return tasks

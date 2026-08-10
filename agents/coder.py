@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from agents.base import Agent, AgentContext
-from orchestrator.strategy import Task
+from maestro.strategy import Task
 
 
 class Coder(Agent):
@@ -35,6 +35,19 @@ class Coder(Agent):
                 "just retry the task normally."
             )
 
+        if context.constraints:
+            parts.append("\nHard constraints for this run (must not be violated):")
+            for c in context.constraints:
+                parts.append(f"- {c}")
+
+        if context.extra.get("no_commit"):
+            parts.append(
+                "\nIMPORTANT: this run has a NO-COMMIT constraint. Do NOT run `git add`/"
+                "`git commit` yourself, regardless of your normal instructions — leave "
+                "your changes uncommitted in the working tree, and set `committed: no` "
+                "in your result block."
+            )
+
         parts.append(
             f"\nFull STRATEGY.md for context:\n\n```markdown\n{context.strategy_text}\n```"
         )
@@ -42,14 +55,17 @@ class Coder(Agent):
 
 
 @dataclass
-class CoderOutcome:
+class AgentOutcome:
+    """Shared result shape for every task-producing agent (Coder, Researcher,
+    Tester) — they all end their message with the same RESULT: block."""
+
     committed: bool
     commit_message: str
     summary: str
 
 
-def parse_coder_result(text: str) -> Optional[CoderOutcome]:
-    m = re.search(r"CODER_RESULT:\s*\n(.*)", text, re.S)
+def parse_agent_result(text: str) -> Optional[AgentOutcome]:
+    m = re.search(r"RESULT:\s*\n(.*)", text, re.S)
     if not m:
         return None
     block = m.group(1)
@@ -59,7 +75,7 @@ def parse_coder_result(text: str) -> Optional[CoderOutcome]:
     summary_m = re.search(r"^- summary:\s*(.+)$", block, re.M)
 
     committed = bool(committed_m and committed_m.group(1).strip().lower() == "yes")
-    return CoderOutcome(
+    return AgentOutcome(
         committed=committed,
         commit_message=msg_m.group(1).strip() if msg_m else "",
         summary=summary_m.group(1).strip() if summary_m else "",

@@ -16,6 +16,18 @@ ordered task plan with explicit, testable acceptance criteria.
 - Every task MUST have concrete, checkable acceptance criteria (e.g. "the
   `/health` endpoint returns 200 with `{\"status\": \"ok\"}`", "running
   `pytest tests/test_auth.py` passes", not "the code works well").
+- Assign each task to exactly one of three agents, based on what kind of
+  work it actually is:
+  - `researcher` — investigation/spike work with no code output: figuring
+    out how existing code works, comparing approaches, diagnosing a bug's
+    root cause, reading a dependency's API. Researcher is read-only — it
+    cannot write code, so don't assign it a task whose acceptance criteria
+    require a code change.
+  - `tester` — writing, extending, or fixing tests (and running them).
+    Tester should not modify non-test source, so don't assign it a task
+    that also requires an application/library code change.
+  - `coder` — everything else: implementation work, including any task
+    that changes application/library source.
 - If you are revising an existing plan (e.g. after a rejection, or because
   the mission changed), preserve tasks that are already done and only add,
   remove, or edit tasks that still need to happen. Do not silently drop
@@ -32,10 +44,12 @@ as-is — no extra commentary inside it):
 ```
 PLAN:
 ### Task 1: <short imperative title>
+- agent: <coder|researcher|tester>
 - acceptance_criteria:
   - <criterion 1>
   - <criterion 2>
 ### Task 2: <short imperative title>
+- agent: <coder|researcher|tester>
 - acceptance_criteria:
   - <criterion 1>
 END_PLAN

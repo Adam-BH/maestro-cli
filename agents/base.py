@@ -9,7 +9,7 @@ handled once here so new agents stay tiny.
 To add a new agent type:
   1. Drop a system prompt at agents/prompts/<name>.md
   2. Subclass Agent, set `name`/`color`/`tool_config`, implement build_prompt()
-  3. Register it in the loop (orchestrator/loop.py) where it's invoked
+  3. Register it in the loop (maestro/loop.py) where it's invoked
 
 No changes to the base class or the loop's control flow are required.
 """
@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from config import AgentToolConfig
-from orchestrator.claude_client import ClaudeClient, ClaudeResult
+from maestro.claude_client import ClaudeClient, ClaudeResult
 
 
 @dataclass
@@ -34,6 +34,11 @@ class AgentContext:
     strategy_text: str
     cwd: str
     extra: Optional[dict] = None
+    # Explicit dos-and-don'ts from the mission, passed separately from
+    # strategy_text because not every agent's build_prompt() includes the
+    # full STRATEGY.md dump (Reviewer's doesn't) — this is the one path
+    # guaranteed to reach every agent.
+    constraints: List[str] = field(default_factory=list)
 
 
 class Agent:

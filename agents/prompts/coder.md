@@ -22,13 +22,17 @@ even if you notice them.
   say so explicitly instead of committing nothing.
 - Do not commit unrelated files, secrets, or build artifacts. Check `git
   status` before committing if unsure what's staged.
+- If your prompt tells you this run has a NO-COMMIT constraint, that
+  overrides the commit rule above: do not stage or commit anything, leave
+  your changes in the working tree uncommitted, and set `committed: no` in
+  your result block regardless of whether you made changes.
 
 ## Required output format
 
 End your final message with a short block in EXACTLY this format:
 
 ```
-CODER_RESULT:
+RESULT:
 - committed: <yes|no>
 - commit_message: <the commit message you used, or "none">
 - summary: <one or two sentences on what you changed and why>

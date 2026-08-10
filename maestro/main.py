@@ -2,9 +2,12 @@
 CLI entrypoint: mission intake, pre-flight verification, and kicking off
 the plan -> code -> review loop.
 
-    python -m orchestrator.main               # interactive mission intake
-    python -m orchestrator.main --plan-only    # print a plan, touch no code
-    python -m orchestrator.main --resume       # pick up an existing STRATEGY.md
+    maestro run                 # interactive mission intake
+    maestro run --plan-only     # print a plan, touch no code
+    maestro run --resume        # pick up an existing STRATEGY.md
+
+(equivalently: `python -m maestro.main run ...` when running from source
+without installing the package)
 """
 
 from __future__ import annotations
@@ -13,73 +16,81 @@ import argparse
 import os
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from config import DEFAULT_CONFIG
-from orchestrator import git_utils
-from orchestrator.claude_client import ClaudeCLINotFound
-from orchestrator.loop import Loop
-from orchestrator.strategy import Strategy
-from orchestrator.ui.console import OrchestratorUI
+from maestro import git_utils
+from maestro.claude_client import ClaudeCLINotFound
+from maestro.loop import Loop
+from maestro.strategy import Strategy
+from maestro.ui.console import MaestroUI
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        prog="agent-orchestrator",
-        description="Orchestrate Planner/Coder/Reviewer Claude Code agents in a plan->build->review loop.",
+        prog="maestro",
+        description="Orchestrate Planner/Coder/Researcher/Tester/Reviewer Claude Code agents in a plan->build->review loop.",
     )
-    p.add_argument(
+    subparsers = p.add_subparsers(dest="command", required=True)
+
+    run_p = subparsers.add_parser(
+        "run",
+        help="Run a mission (plan -> build -> review loop) in the current or given directory.",
+        description="Run a mission (plan -> build -> review loop) in the current or given directory.",
+    )
+    run_p.add_argument(
         "--dry-run", "--plan-only", dest="plan_only", action="store_true",
         help="Run only the Planner and print the resulting plan; touch no code.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--resume", action="store_true",
         help="Resume from an existing STRATEGY.md instead of prompting for a new mission.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--dir", "-C", dest="dir", default=None,
         help="Project directory to build in (created if missing). Defaults to the "
         "current directory, or an interactive prompt if unset. With --resume, this "
         "is where the existing STRATEGY.md lives.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--strategy-file", default=DEFAULT_CONFIG.strategy_path,
         help=f"Path to the strategy file (default: {DEFAULT_CONFIG.strategy_path}).",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--model", default=DEFAULT_CONFIG.model,
         help="Model passed to `claude -p --model`.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--max-task-retries", type=int, default=DEFAULT_CONFIG.max_task_retries,
         help="Max Coder retries per task after a Reviewer REJECT before escalating to NEEDS_HUMAN.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--max-total-iterations", type=int, default=DEFAULT_CONFIG.max_total_iterations,
         help="Hard cap on total task cycles for the whole run.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--commit-every-attempt", action="store_true", default=DEFAULT_CONFIG.commit_every_attempt,
         help="Checkpoint-commit after every Coder attempt, not just approved tasks.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--no-bare", dest="bare", action="store_false", default=DEFAULT_CONFIG.bare,
         help="Don't pass --bare to `claude -p` (use normal auth/hooks/CLAUDE.md). "
         "Auto-disabled anyway when ANTHROPIC_API_KEY isn't set.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip interactive confirmations (mission confirm, dirty-tree prompts). For scripted use.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--pause-on-human", action="store_true",
         help="Stop and wait at a terminal prompt every time a task needs human input, "
         "like earlier versions did. Default is unattended: a blocked task is parked "
         "and the loop moves on to the next one, so a single bad task can't stall an "
         "overnight run.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--retry-blocked", action="store_true",
         help="With --resume: reset any needs_human tasks back to pending (attempts=0) "
         "before continuing, so they get another shot after you've fixed whatever blocked them.",
@@ -100,9 +111,9 @@ def build_config(args: argparse.Namespace):
 
 # -- mission intake --------------------------------------------------
 
-def prompt_mission(ui: OrchestratorUI) -> str:
+def prompt_mission(ui: MaestroUI) -> str:
     ui.console.print(
-        "[bold cyan]AgentOrchestrator[/bold cyan] — describe the mission "
+        "[bold cyan]Maestro[/bold cyan] — describe the mission "
         "(what should be built/fixed/changed). Finish with an empty line.\n"
     )
     lines = []
@@ -117,54 +128,79 @@ def prompt_mission(ui: OrchestratorUI) -> str:
     return "\n".join(lines).strip()
 
 
-def clean_mission(ui: OrchestratorUI, client, cfg, mission: str) -> tuple:
+@dataclass
+class MissionIntake:
+    mission: str
+    slug: Optional[str]
+    constraints: List[str] = field(default_factory=list)
+    no_commit: bool = False
+
+
+def enhance_mission(ui: MaestroUI, client, cfg, mission: str) -> MissionIntake:
     """One-shot `claude -p` pass that tidies typos/phrasing in the raw
-    mission and suggests a folder-name slug for it. Falls back to
-    (raw mission, None) on any error — this is a nicety, not something
-    worth blocking the run over. Returns (cleaned_mission, slug_or_None)."""
-    prompt_path = Path(cfg.prompts_dir) / "mission_cleaner.md"
+    mission, extracts any constraints the user explicitly stated, and
+    suggests a folder-name slug. Falls back to the raw mission with no
+    constraints/slug on any error — this is a nicety, not something worth
+    blocking the run over."""
+    prompt_path = Path(cfg.prompts_dir) / "mission_enhancer.md"
     system_prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
 
-    ui.console.print("[dim]Cleaning up mission wording via Claude...[/dim]")
+    ui.console.print("[dim]Enhancing your prompt via Claude...[/dim]")
     result = client.run(
         prompt=f"Raw mission:\n\n{mission}",
         allowed_tools="",
-        max_turns=cfg.mission_cleaner_max_turns,
+        max_turns=cfg.mission_enhancer_max_turns,
         permission_mode="acceptEdits",
         system_prompt=system_prompt,
     )
     if not result.ok:
         ui.console.print(
-            f"[yellow]Mission cleanup skipped ({result.error_message or 'agent error'}); "
+            f"[yellow]Prompt enhancing skipped ({result.error_message or 'agent error'}); "
             "using your original wording.[/yellow]"
         )
-        return mission, None
+        return MissionIntake(mission=mission, slug=None)
 
     text = result.result_text
-    m = re.search(r"CLEANED_MISSION:\s*\n(.*?)(?:\n+FOLDER_SLUG:|\Z)", text, re.S)
+    m = re.search(r"CLEANED_MISSION:\s*\n(.*?)(?:\n+CONSTRAINTS:|\n+FOLDER_SLUG:|\Z)", text, re.S)
     cleaned = m.group(1).strip() if m else ""
     if not cleaned:
-        ui.console.print("[yellow]Mission cleanup skipped (no parseable output); using your original wording.[/yellow]")
+        ui.console.print("[yellow]Prompt enhancing skipped (no parseable output); using your original wording.[/yellow]")
         cleaned = mission
+
+    constraints: List[str] = []
+    cm = re.search(r"CONSTRAINTS:\s*\n(.*?)(?:\n+NO_COMMIT:|\n+FOLDER_SLUG:|\Z)", text, re.S)
+    if cm:
+        block = cm.group(1).strip()
+        if block and block != "(none)":
+            constraints = [
+                line.strip().lstrip("- ").strip()
+                for line in block.splitlines()
+                if line.strip().startswith("-")
+            ]
+
+    no_commit = False
+    ncm = re.search(r"NO_COMMIT:\s*(\w+)", text)
+    if ncm:
+        no_commit = ncm.group(1).strip().lower() == "yes"
 
     slug = None
     sm = re.search(r"FOLDER_SLUG:\s*\n?\s*([a-zA-Z0-9][a-zA-Z0-9-]*)", text)
     if sm:
         slug = re.sub(r"[^a-z0-9-]", "-", sm.group(1).strip().lower()).strip("-") or None
 
-    return cleaned, slug
+    return MissionIntake(mission=cleaned, slug=slug, constraints=constraints, no_commit=no_commit)
 
 
 # -- project directory selection ---------------------------------------
 
-# Files that mark a directory as AgentOrchestrator's own source tree (as
+# Files that mark a directory as Maestro's own source tree (as
 # opposed to some project it's been pointed at). Checked so a run launched
-# from inside AgentOrchestrator's own checkout doesn't build a project into
+# from inside Maestro's own checkout doesn't build a project into
 # its source instead of a dedicated folder.
-_SOURCE_MARKERS = (Path("orchestrator") / "main.py", Path("agents") / "base.py", Path("config.py"))
+_SOURCE_MARKERS = (Path("maestro") / "main.py", Path("agents") / "base.py", Path("config.py"))
 
 
-def is_orchestrator_source(path) -> bool:
+def is_maestro_source(path) -> bool:
     p = Path(path)
     return all((p / marker).exists() for marker in _SOURCE_MARKERS)
 
@@ -176,17 +212,17 @@ def default_project_slug(mission: str) -> str:
 
 
 def choose_project_dir(
-    ui: OrchestratorUI, mission: str, args: argparse.Namespace, suggested_slug: Optional[str] = None
+    ui: MaestroUI, mission: str, args: argparse.Namespace, suggested_slug: Optional[str] = None
 ) -> str:
     """Pick (and create) the directory the mission will be built in. Never
-    returns AgentOrchestrator's own source directory. Defaults to a fresh,
+    returns Maestro's own source directory. Defaults to a fresh,
     named subfolder (Claude's suggested slug, or a naive fallback) rather
     than dumping the project into whatever directory happened to be cwd."""
 
     slug = suggested_slug or default_project_slug(mission)
 
     def fallback_default() -> Path:
-        base = Path.home() / "Desktop" if is_orchestrator_source(Path.cwd()) else Path.cwd()
+        base = Path.home() / "Desktop" if is_maestro_source(Path.cwd()) else Path.cwd()
         return base / slug
 
     if args.dir:
@@ -202,9 +238,9 @@ def choose_project_dir(
         raw = input(f"Path [{default}]: ").strip()
         candidate = Path(raw).expanduser().resolve() if raw else default
 
-    while is_orchestrator_source(candidate):
+    while is_maestro_source(candidate):
         ui.print_error(
-            f"{candidate} is AgentOrchestrator's own source directory — refusing "
+            f"{candidate} is Maestro's own source directory — refusing "
             "to build a project there, it would get mixed into this tool's code.\n\n"
             "Pick a different directory."
         )
@@ -231,14 +267,14 @@ def guess_mentioned_paths(mission: str) -> list:
     return sorted(candidates)
 
 
-def preflight(ui: OrchestratorUI, mission: str, cwd: str, skip_prompts: bool) -> bool:
+def preflight(ui: MaestroUI, mission: str, cwd: str, skip_prompts: bool) -> bool:
     """Returns True if it's safe to proceed."""
     check = git_utils.check_repo(cwd=cwd)
 
     if not check.is_repo:
         ui.print_panel(
             "Not a git repository yet",
-            f"{cwd}\n\nAgentOrchestrator commits checkpoints as it works, so it "
+            f"{cwd}\n\nMaestro commits checkpoints as it works, so it "
             "needs one — running `git init` here.",
             style="yellow",
         )
@@ -258,19 +294,19 @@ def preflight(ui: OrchestratorUI, mission: str, cwd: str, skip_prompts: bool) ->
         ui.print_panel(
             "Working tree not clean",
             f"Branch: {check.branch}\n\n{check.status_text}\n\n"
-            "AgentOrchestrator's checkpoint commits will get tangled up with "
+            "Maestro's checkpoint commits will get tangled up with "
             "these existing changes.",
             style="yellow",
         )
         if skip_prompts:
-            git_utils.stash(cwd=cwd, message="AgentOrchestrator: autostash before run")
+            git_utils.stash(cwd=cwd, message="Maestro: autostash before run")
             ui.print_panel("Stashed", "Existing changes stashed automatically (--yes).", style="yellow")
         else:
             choice = input("[s]tash them, [c]ommit them, [i]gnore, or [q]uit? ").strip().lower()
             if choice == "s":
-                git_utils.stash(cwd=cwd, message="AgentOrchestrator: autostash before run")
+                git_utils.stash(cwd=cwd, message="Maestro: autostash before run")
             elif choice == "c":
-                git_utils.commit_all("Checkpoint before AgentOrchestrator run", cwd=cwd)
+                git_utils.commit_all("Checkpoint before Maestro run", cwd=cwd)
             elif choice == "q":
                 return False
             # "i" falls through and proceeds with a dirty tree
@@ -294,21 +330,26 @@ def preflight(ui: OrchestratorUI, mission: str, cwd: str, skip_prompts: bool) ->
 def main(argv=None) -> int:
     args = parse_args(argv)
     cfg = build_config(args)
-    ui = OrchestratorUI()
+    ui = MaestroUI()
 
     try:
-        from orchestrator.claude_client import ClaudeClient
+        from maestro.claude_client import ClaudeClient
 
         client = ClaudeClient(model=cfg.model, bare=cfg.bare)
     except ClaudeCLINotFound as exc:
         ui.print_error(str(exc))
         return 1
 
+    # cost_usd from `claude -p` is only a real charge under --bare/API-key
+    # billing; under OAuth/subscription auth it's an estimate with no
+    # actual cost behind it, so hide it there rather than show noise.
+    ui.show_cost = client.bare
+
     if cfg.bare and not client.bare:
         ui.print_panel(
             "Auth notice",
             "--bare mode requires ANTHROPIC_API_KEY (OAuth/keychain auth isn't "
-            "readable in bare mode) and no API key is set, so AgentOrchestrator "
+            "readable in bare mode) and no API key is set, so Maestro "
             "is running agents WITHOUT --bare — they'll pick up your normal "
             "Claude Code auth, hooks, and CLAUDE.md.",
             style="yellow",
@@ -339,7 +380,8 @@ def main(argv=None) -> int:
             ui.print_error("Empty mission, nothing to do.")
             return 1
 
-        mission, slug = clean_mission(ui, client, cfg, raw_mission)
+        intake = enhance_mission(ui, client, cfg, raw_mission)
+        mission, slug = intake.mission, intake.slug
         ui.print_mission(mission)
 
         target_dir = choose_project_dir(ui, mission, args, suggested_slug=slug)
@@ -357,7 +399,8 @@ def main(argv=None) -> int:
                 if not raw_mission:
                     ui.print_error("Empty mission, nothing to do.")
                     return 1
-                mission, slug = clean_mission(ui, client, cfg, raw_mission)
+                intake = enhance_mission(ui, client, cfg, raw_mission)
+                mission, slug = intake.mission, intake.slug
                 ui.print_mission(mission)
                 continue
             if choice in ("f", "folder"):
@@ -372,9 +415,25 @@ def main(argv=None) -> int:
             ui.console.print("Pre-flight checks failed or were declined. Aborting.")
             return 1
 
-        strategy = Strategy(mission=mission, run_status="planning")
-        strategy.add_log("system", "Mission received, cleaned via Claude; starting Planner.")
+        strategy = Strategy(
+            mission=mission,
+            run_status="planning",
+            constraints=intake.constraints,
+            no_commit=intake.no_commit,
+        )
+        strategy.add_log("system", "Mission received, enhanced via Claude; starting Planner.")
         strategy.save(cfg.strategy_path)
+
+    if strategy.no_commit:
+        ui.print_panel(
+            "No-commit mode active",
+            "This run's mission specifies not to commit changes, so Maestro "
+            "will not create checkpoint or approval commits, and the Coder/Tester agents "
+            "have been told not to commit either.\n\n"
+            "This means --resume has no commit history to roll back to for this run — a "
+            "crash mid-task loses whatever work wasn't yet Reviewer-approved.",
+            style="yellow",
+        )
 
     loop = Loop(cfg, strategy, ui, target_dir, client=client)
     unattended = not args.pause_on_human
@@ -410,7 +469,7 @@ def main(argv=None) -> int:
     return 2
 
 
-def _handle_pause(ui: OrchestratorUI, task_id: str, reason: str) -> bool:
+def _handle_pause(ui: MaestroUI, task_id: str, reason: str) -> bool:
     """Interactive NEEDS_HUMAN handler used by main(). Returns True to
     retry the paused task, False to stop the run."""
     ui.stop_live()

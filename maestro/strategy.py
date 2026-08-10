@@ -45,6 +45,10 @@ class Task:
     attempts: int = 0
     acceptance_criteria: List[str] = field(default_factory=list)
     notes: str = ""
+    # Which specialized agent implements this task: "coder" | "researcher"
+    # | "tester". Defaults to "coder" so STRATEGY.md files written before
+    # this field existed still parse and run exactly as before.
+    agent: str = "coder"
 
     def is_done(self) -> bool:
         return self.status == "done"
@@ -70,6 +74,14 @@ class Strategy:
     # Best-effort "when to retry" hint, set when a run pauses because of a
     # usage/rate limit rather than a per-task problem. Empty otherwise.
     resume_after: str = ""
+    # Explicit dos-and-don'ts the user stated in the raw mission, extracted
+    # by the prompt-enhancer pass at intake. Fed into every agent's prompt
+    # so constraints are respected for the whole run, not just at intake.
+    constraints: List[str] = field(default_factory=list)
+    # Set when the mission explicitly says not to commit. Disables both the
+    # Maestro's own checkpoint commits and the Coder/Tester's own
+    # commit step for the whole run — see Loop.run_task_cycle.
+    no_commit: bool = False
     tasks: List[Task] = field(default_factory=list)
     log: List[LogEntry] = field(default_factory=list)
 
@@ -102,6 +114,13 @@ class Strategy:
     def render(self) -> str:
         lines = ["# STRATEGY", "", "## Mission", "", self.mission.strip() or "(none)", ""]
 
+        lines += ["## Constraints", ""]
+        if self.constraints:
+            lines += [f"- {c}" for c in self.constraints]
+        else:
+            lines.append("(none)")
+        lines.append("")
+
         lines += [
             "## Meta",
             "",
@@ -110,6 +129,7 @@ class Strategy:
             f"- Created: {self.created}",
             f"- Updated: {self.updated}",
             f"- Resume After: {self.resume_after or '(none)'}",
+            f"- No Commit: {'yes' if self.no_commit else 'no'}",
             "",
         ]
 
@@ -120,6 +140,7 @@ class Strategy:
             lines.append(f"### Task {t.id}: {t.title}")
             lines.append(f"- status: {t.status}")
             lines.append(f"- attempts: {t.attempts}")
+            lines.append(f"- agent: {t.agent}")
             if t.acceptance_criteria:
                 lines.append("- acceptance_criteria:")
                 for c in t.acceptance_criteria:
@@ -160,6 +181,18 @@ class Strategy:
             mission = mission_match.group(1).strip()
             strategy.mission = "" if mission == "(none)" else mission
 
+        # Absent on STRATEGY.md files written before constraints existed —
+        # the regex simply won't match, leaving the dataclass default ([]).
+        constraints_match = re.search(r"^## Constraints\s*\n+(.*?)(?=\n## )", text, re.S | re.M)
+        if constraints_match:
+            block = constraints_match.group(1).strip()
+            if block and block != "(none)":
+                strategy.constraints = [
+                    line.strip().lstrip("- ").strip()
+                    for line in block.splitlines()
+                    if line.strip().startswith("-")
+                ]
+
         meta_match = re.search(r"^## Meta\s*\n+(.*?)(?=\n## )", text, re.S | re.M)
         if meta_match:
             meta_block = meta_match.group(1)
@@ -169,6 +202,7 @@ class Strategy:
                 ("Created", "created", str),
                 ("Updated", "updated", str),
                 ("Resume After", "resume_after", lambda v: "" if v == "(none)" else v),
+                ("No Commit", "no_commit", lambda v: v.strip().lower() in ("yes", "true", "1")),
             ]:
                 m = re.search(rf"^- {key}: (.+)$", meta_block, re.M)
                 if m:
@@ -193,6 +227,10 @@ class Strategy:
                 attempts_m = re.search(r"^- attempts: (\d+)$", body, re.M)
                 if attempts_m:
                     task.attempts = int(attempts_m.group(1))
+
+                agent_m = re.search(r"^- agent: (.+)$", body, re.M)
+                if agent_m:
+                    task.agent = agent_m.group(1).strip()
 
                 notes_m = re.search(r"^- notes: (.+)$", body, re.M)
                 if notes_m:

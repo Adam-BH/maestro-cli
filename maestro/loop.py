@@ -31,20 +31,22 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 from agents.base import AgentContext
-from agents.coder import Coder, parse_coder_result
+from agents.coder import Coder, parse_agent_result
 from agents.planner import Planner, parse_plan
+from agents.researcher import Researcher
 from agents.reviewer import Reviewer, parse_verdict
+from agents.tester import Tester
 from config import Config
-from orchestrator import git_utils
-from orchestrator.claude_client import (
+from maestro import git_utils
+from maestro.claude_client import (
     ClaudeClient,
     ClaudeResult,
     extract_resume_hint,
     is_rate_limited,
     summarize_stream_event,
 )
-from orchestrator.strategy import Strategy, Task
-from orchestrator.ui.console import OrchestratorUI
+from maestro.strategy import Strategy, Task
+from maestro.ui.console import MaestroUI
 
 OUTCOME_APPROVED = "approved"
 OUTCOME_NEEDS_HUMAN = "needs_human"
@@ -56,7 +58,7 @@ class Loop:
         self,
         config: Config,
         strategy: Strategy,
-        ui: OrchestratorUI,
+        ui: MaestroUI,
         cwd: str,
         client: "ClaudeClient | None" = None,
     ):
@@ -70,18 +72,25 @@ class Loop:
             self.client = client
         else:
             self.client = ClaudeClient(model=config.model, bare=config.bare)
+            ui.show_cost = self.client.bare
             if config.bare and not self.client.bare:
                 ui.print_panel(
                     "Auth notice",
                     "--bare mode requires ANTHROPIC_API_KEY (OAuth/keychain auth "
                     "isn't readable in bare mode) and no API key is set, so "
-                    "AgentOrchestrator is running agents WITHOUT --bare — they'll "
+                    "Maestro is running agents WITHOUT --bare — they'll "
                     "pick up your normal Claude Code auth, hooks, and CLAUDE.md.",
                     style="yellow",
                 )
         self.planner = Planner(self.client, config.agents["planner"], config.prompts_dir, config.log_dir)
         self.coder = Coder(self.client, config.agents["coder"], config.prompts_dir, config.log_dir)
+        self.researcher = Researcher(self.client, config.agents["researcher"], config.prompts_dir, config.log_dir)
+        self.tester = Tester(self.client, config.agents["tester"], config.prompts_dir, config.log_dir)
         self.reviewer = Reviewer(self.client, config.agents["reviewer"], config.prompts_dir, config.log_dir)
+        # Task.agent -> the agent instance that implements it. Reviewer is
+        # not in here; it always runs afterward regardless of who produced
+        # the work.
+        self.producers = {"coder": self.coder, "researcher": self.researcher, "tester": self.tester}
 
         self.ui.attach_strategy(strategy)
 
@@ -145,7 +154,10 @@ class Loop:
             attempt += 1
             self.ui.set_agent("planner", f"revising plan (attempt {attempt})" if revising else f"planning (attempt {attempt})")
             context = AgentContext(
-                strategy_text=self.strategy.render(), cwd=self.cwd, extra={"revising": revising}
+                strategy_text=self.strategy.render(),
+                cwd=self.cwd,
+                extra={"revising": revising},
+                constraints=self.strategy.constraints,
             )
             result = self.planner.run(context, on_event=self._event_logger("planner"))
             self.ui.record_call(result.cost_usd, result.num_turns)
@@ -226,6 +238,7 @@ class Loop:
         OUTCOME_RATE_LIMITED."""
 
         last_rejection: Optional[str] = task.notes if task.status == "rejected" else None
+        producer = self.producers.get(task.agent, self.coder)
 
         while True:
             task.attempts += 1
@@ -233,36 +246,41 @@ class Loop:
             self.strategy.add_log("system", f"Attempt {task.attempts} on {task.id}: {task.title}")
             self.save()
 
-            self.ui.set_agent("coder", f"{task.id} (attempt {task.attempts}/{self.config.max_task_retries})")
-            coder_ctx = AgentContext(
+            self.ui.set_agent(producer.name, f"{task.id} (attempt {task.attempts}/{self.config.max_task_retries})")
+            producer_ctx = AgentContext(
                 strategy_text=self.strategy.render(),
                 cwd=self.cwd,
-                extra={"task": task, "rejection_reason": last_rejection},
+                extra={
+                    "task": task,
+                    "rejection_reason": last_rejection,
+                    "no_commit": self.strategy.no_commit,
+                },
+                constraints=self.strategy.constraints,
             )
-            coder_result = self.coder.run(coder_ctx, on_event=self._event_logger("coder"))
-            self.ui.record_call(coder_result.cost_usd, coder_result.num_turns)
+            producer_result = producer.run(producer_ctx, on_event=self._event_logger(producer.name))
+            self.ui.record_call(producer_result.cost_usd, producer_result.num_turns)
 
-            if not coder_result.ok:
+            if not producer_result.ok:
                 self.ui.clear_agent()
-                rl = self._rate_limit_text(coder_result)
+                rl = self._rate_limit_text(producer_result)
                 if rl:
                     task.status = "pending"
                     task.attempts -= 1  # this attempt never really happened
                     return OUTCOME_RATE_LIMITED, rl
-                self.ui.log("coder", f"ERROR: {coder_result.error_message}")
-                self.strategy.add_log("coder", f"{task.id}: invocation error: {coder_result.error_message}")
-                escalation = self._retry_or_escalate(task, f"Coder invocation failed: {coder_result.error_message}")
+                self.ui.log(producer.name, f"ERROR: {producer_result.error_message}")
+                self.strategy.add_log(producer.name, f"{task.id}: invocation error: {producer_result.error_message}")
+                escalation = self._retry_or_escalate(task, f"{producer.name.capitalize()} invocation failed: {producer_result.error_message}")
                 if escalation:
                     return escalation
                 last_rejection = task.notes
                 continue
 
-            coder_outcome = parse_coder_result(coder_result.result_text)
-            summary = coder_outcome.summary if coder_outcome else (coder_result.result_text or "")[-500:]
-            self.ui.log("coder", summary or "(no summary returned)")
-            self.strategy.add_log("coder", f"{task.id} attempt {task.attempts}: {summary}")
+            producer_outcome = parse_agent_result(producer_result.result_text)
+            summary = producer_outcome.summary if producer_outcome else (producer_result.result_text or "")[-500:]
+            self.ui.log(producer.name, summary or "(no summary returned)")
+            self.strategy.add_log(producer.name, f"{task.id} attempt {task.attempts}: {summary}")
 
-            if self.config.commit_every_attempt:
+            if self.config.commit_every_attempt and not self.strategy.no_commit:
                 sha = git_utils.commit_all(
                     f"[checkpoint] {task.id} attempt {task.attempts}", cwd=self.cwd
                 )
@@ -273,7 +291,12 @@ class Loop:
             review_ctx = AgentContext(
                 strategy_text=self.strategy.render(),
                 cwd=self.cwd,
-                extra={"task": task, "coder_summary": summary},
+                extra={
+                    "task": task,
+                    "coder_summary": summary,
+                    "no_commit": self.strategy.no_commit,
+                },
+                constraints=self.strategy.constraints,
             )
             review_result = self.reviewer.run(review_ctx, on_event=self._event_logger("reviewer"))
             self.ui.record_call(review_result.cost_usd, review_result.num_turns)
@@ -312,9 +335,10 @@ class Loop:
             if verdict.approved:
                 task.status = "done"
                 task.notes = ""
-                sha = git_utils.commit_all(f"[approved] {task.id}: {task.title}", cwd=self.cwd)
-                if sha:
-                    self.commits.append((sha, f"[approved] {task.id}: {task.title}"))
+                if not self.strategy.no_commit:
+                    sha = git_utils.commit_all(f"[approved] {task.id}: {task.title}", cwd=self.cwd)
+                    if sha:
+                        self.commits.append((sha, f"[approved] {task.id}: {task.title}"))
                 return OUTCOME_APPROVED, ""
 
             if verdict.needs_human:
@@ -349,6 +373,7 @@ class Loop:
             self.save()
             if status != "ok":
                 return self.strategy.run_status
+            self.ui.print_plan_summary(self.strategy.tasks)
 
         if plan_only:
             return self.strategy.run_status
@@ -387,7 +412,7 @@ class Loop:
                     self.strategy.add_log(
                         "system", f"{task.id} needs human input — continuing unattended. Reason: {reason}"
                     )
-                    self.ui.log("system", f"{task.id} parked (needs human), moving to next task.")
+                    self.ui.print_needs_human(task.id, reason)
                     self.save()
                     continue
 

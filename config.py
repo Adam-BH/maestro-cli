@@ -1,8 +1,8 @@
 """
-Central configuration for AgentOrchestrator.
+Central configuration for Maestro.
 
 Nothing here talks to the network or the filesystem beyond reading env vars;
-it just defines defaults that `orchestrator/main.py` wires into the rest of
+it just defines defaults that `maestro/main.py` wires into the rest of
 the app (and that CLI flags can override at runtime).
 """
 
@@ -12,9 +12,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# agents/prompts/*.md ships alongside this file inside the AgentOrchestrator
+# agents/prompts/*.md ships alongside this file inside the Maestro
 # install — it must be found there regardless of which target repo the
-# orchestrator is run against (STRATEGY.md, logs/, etc. are relative to
+# maestro is run against (STRATEGY.md, logs/, etc. are relative to
 # *that* repo's cwd instead; see strategy_path/log_dir below).
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 
@@ -31,8 +31,8 @@ class AgentToolConfig:
 @dataclass
 class Config:
     # Model used for every `claude -p` invocation. Override with
-    # AGENTORCH_MODEL if you want a cheaper/faster model for iteration.
-    model: str = field(default_factory=lambda: os.environ.get("AGENTORCH_MODEL", "sonnet"))
+    # MAESTRO_MODEL if you want a cheaper/faster model for iteration.
+    model: str = field(default_factory=lambda: os.environ.get("MAESTRO_MODEL", "sonnet"))
 
     # How many times Coder may retry a single task after a Reviewer REJECT
     # before the loop escalates to NEEDS_HUMAN itself.
@@ -66,9 +66,9 @@ class Config:
     # install rather than the target repo's cwd — see _PACKAGE_ROOT above.
     prompts_dir: str = str(_PACKAGE_ROOT / "agents" / "prompts")
 
-    # Turn budget for the one-shot mission-cleanup pass at intake (no
-    # tools, pure text tidy-up — kept tiny on purpose).
-    mission_cleaner_max_turns: int = 3
+    # Turn budget for the one-shot prompt-enhancing pass at intake (no
+    # tools, pure text tidy-up + constraint extraction — kept tiny on purpose).
+    mission_enhancer_max_turns: int = 4
 
     agents: dict = field(
         default_factory=lambda: {
@@ -77,6 +77,14 @@ class Config:
                 max_turns=15,
             ),
             "coder": AgentToolConfig(
+                allowed_tools="Read,Edit,Write,Glob,Grep,Bash",
+                max_turns=25,
+            ),
+            "researcher": AgentToolConfig(
+                allowed_tools="Read,Glob,Grep,Bash(git *)",
+                max_turns=20,
+            ),
+            "tester": AgentToolConfig(
                 allowed_tools="Read,Edit,Write,Glob,Grep,Bash",
                 max_turns=25,
             ),

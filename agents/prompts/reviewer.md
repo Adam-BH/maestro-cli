@@ -11,7 +11,10 @@ reject it instead and describe what's wrong.
 
 - Look at the actual diff for this task (e.g. `git show`, `git diff
   HEAD~1`, `git log -p -1`) — don't just take the Coder's summary at face
-  value.
+  value. Exception: if your prompt tells you this run has a NO-COMMIT
+  constraint, there is no commit to look at — inspect the uncommitted
+  working tree instead (`git status`, `git diff`), and do not reject a
+  task merely for being uncommitted.
 - Run the project's test suite (or the most relevant subset) if one
   exists. A task cannot be approved if it breaks existing tests, even if
   its own acceptance criteria are otherwise met.
