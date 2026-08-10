@@ -81,22 +81,77 @@ you describe a mission
 └── (loop back with rejection reason as context)
 ```
 
-## Quick start
+## Installation
 
-Install it as a real command (recommended — `pipx` keeps it in its own
-isolated environment so it can't clash with other projects' dependencies):
+Maestro isn't on PyPI yet, but you don't need to clone the repo by hand to
+install it — `pip`/`pipx` can install straight from the GitHub URL.
+
+Requires **Python 3.9+**, **git**, and the **`claude` CLI** on your `PATH`,
+logged in (or `ANTHROPIC_API_KEY` set — see the `--bare` note further
+down) — [install Claude Code](https://docs.claude.com/claude-code) first
+if you haven't.
+
+### Option 1: pipx (recommended)
+
+`pipx` installs `maestro` as a standalone command in its own isolated
+environment, so its dependencies can't clash with any other project's, and
+the `maestro` command is immediately on your `PATH`. Nothing gets cloned
+to disk for you to manage.
 
 ```bash
-pipx install .          # from a checkout of this repo
-# or: pip install .     # into your current environment/venv
-maestro run              # interactive: describe your mission, in the current directory
+pipx install git+https://github.com/Adam-BH/maestro-cli.git
 ```
 
-Or run straight from a source checkout without installing anything:
+Don't have `pipx` yet?
 
 ```bash
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+# restart your shell, then re-run the pipx install command above
+```
+
+### Option 2: pip, straight from GitHub
+
+```bash
+pip install git+https://github.com/Adam-BH/maestro-cli.git
+```
+
+This installs into whatever environment `pip` currently points at — use a
+virtualenv unless you're sure you want it system/user-wide.
+
+### Option 3: from a local clone (for contributing to Maestro itself)
+
+Only needed if you're planning to edit Maestro's own source:
+
+```bash
+git clone https://github.com/Adam-BH/maestro-cli.git
+cd maestro-cli
+pipx install .          # or: pip install .
+# or run without installing anything:
 pip install -r requirements.txt   # just `rich`
-python -m maestro.main run        # same as `maestro run` above
+python -m maestro.main run        # same as `maestro run` below
+```
+
+### Verify it worked
+
+```bash
+maestro --help
+```
+
+### Updating / uninstalling
+
+```bash
+pipx upgrade maestro
+# or force-reinstall the latest commit:
+pipx install --force git+https://github.com/Adam-BH/maestro-cli.git
+
+pipx uninstall maestro
+```
+
+## Quick start
+
+```bash
+maestro run              # interactive: describe your mission, in the current directory
 ```
 
 `run` is the only subcommand today; more may show up later (e.g. a
@@ -121,8 +176,8 @@ directory (detected by the presence of `maestro/main.py` +
 `~/Desktop/<slug-of-your-mission>` instead of mixing your project into this
 tool's code. Pass `--dir` explicitly to target anywhere else.
 
-Requires the `claude` CLI on your `PATH` and a git repository (the tool
-will offer to `git init` for you if you're not in one yet).
+Also requires a git repository at the target project dir — the tool
+will offer to `git init` for you if you're not in one yet.
 
 ### Mission intake
 
