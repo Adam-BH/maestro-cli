@@ -32,6 +32,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="maestro",
         description="Orchestrate Planner/Coder/Researcher/Tester/Reviewer Claude Code agents in a plan->build->review loop.",
+        epilog="Run `maestro run --help` for the full list of run options and examples.",
     )
     subparsers = p.add_subparsers(dest="command", required=True)
 
@@ -39,6 +40,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         "run",
         help="Run a mission (plan -> build -> review loop) in the current or given directory.",
         description="Run a mission (plan -> build -> review loop) in the current or given directory.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  maestro run                                     Start a new mission (interactive prompts)
+  maestro run --yes                               Start a new mission, unattended (no prompts)
+  maestro run --dry-run                           Preview the Planner's task list only; no code touched
+  maestro run --resume                            Resume an existing STRATEGY.md in the current directory
+  maestro run --resume -C /path/to/project         Resume a STRATEGY.md living in another directory
+  maestro run --resume --yes                       Resume, unattended
+  maestro run --resume --retry-blocked --yes       Resume and give any needs_human tasks another shot
+                                                    (e.g. right after fixing whatever tool/permission
+                                                    problem caused them to get stuck)
+  maestro run --resume --pause-on-human            Resume, but stop at a terminal prompt on every
+                                                    needs_human task instead of parking it and moving on
+
+A crash or Ctrl-C mid-run is always safe to recover from with `maestro run --resume` --
+progress lives in STRATEGY.md (and, unless the mission was NO-COMMIT, in git history).
+""",
     )
     run_p.add_argument(
         "--dry-run", "--plan-only", dest="plan_only", action="store_true",
