@@ -89,8 +89,18 @@ class Config:
                 max_turns=25,
             ),
             "reviewer": AgentToolConfig(
-                allowed_tools="Read,Glob,Grep,Bash(pytest *),Bash(python -m pytest*),"
-                "Bash(npm test*),Bash(npm run test*),Bash(go test*),Bash(git *)",
+                # Plain Bash, same as coder/tester: a prefix allowlist
+                # (Bash(node *), Bash(npm test*), ...) looks safer but isn't
+                # — it breaks on anything the allowlist author didn't
+                # anticipate (env-var prefixes like `PORT=3457 node ...`,
+                # commands chained with && / ;, etc.), which in practice
+                # meant the reviewer couldn't verify projects that don't
+                # have a test suite yet and burned its turn budget retrying
+                # denied variations instead of ever reaching a verdict.
+                # Edit/Write are still withheld — that's the actual
+                # verifies-never-fixes boundary — enforced structurally
+                # here, not just requested in the prompt.
+                allowed_tools="Read,Glob,Grep,Bash",
                 max_turns=15,
             ),
         }

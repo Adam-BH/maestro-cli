@@ -32,6 +32,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="maestro",
         description="Orchestrate Planner/Coder/Researcher/Tester/Reviewer Claude Code agents in a plan->build->review loop.",
+        epilog="Run `maestro run --help` for the full list of run options and examples.",
     )
     subparsers = p.add_subparsers(dest="command", required=True)
 
@@ -39,6 +40,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         "run",
         help="Run a mission (plan -> build -> review loop) in the current or given directory.",
         description="Run a mission (plan -> build -> review loop) in the current or given directory.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  maestro run                                     Start a new mission (interactive prompts)
+  maestro run --yes                               Start a new mission, unattended (no prompts)
+  maestro run --dry-run                           Preview the Planner's task list only; no code touched
+  maestro run --resume                            Resume an existing STRATEGY.md in the current directory
+  maestro run --resume -C /path/to/project         Resume a STRATEGY.md living in another directory
+  maestro run --resume --yes                       Resume, unattended
+  maestro run --resume --retry-blocked --yes       Resume and give any needs_human tasks another shot
+                                                    (e.g. right after fixing whatever tool/permission
+                                                    problem caused them to get stuck)
+  maestro run --resume --pause-on-human            Resume, but stop at a terminal prompt on every
+                                                    needs_human task instead of parking it and moving on
+
+A crash or Ctrl-C mid-run is always safe to recover from with `maestro run --resume` --
+progress lives in STRATEGY.md (and, unless the mission was NO-COMMIT, in git history).
+""",
     )
     run_p.add_argument(
         "--dry-run", "--plan-only", dest="plan_only", action="store_true",
@@ -365,6 +384,23 @@ def main(argv=None) -> int:
         ui.console.print(f"[cyan]Resumed strategy from {target_dir}/{cfg.strategy_path}[/cyan] "
                           f"({strategy.progress()[0]}/{strategy.progress()[1]} tasks done, "
                           f"iteration {strategy.iteration}, status={strategy.run_status}).")
+
+        # status == "in_progress" only means something *while* a Loop is
+        # actively driving that task. On --resume that Loop is gone by
+        # definition (a crash, Ctrl-C, or a kill), so any task still marked
+        # in_progress was interrupted before it reached a checkpointed state
+        # (pending_review, rejected, or done) — reset it so it isn't
+        # silently skipped forever by next_pending_task().
+        stuck = [t for t in strategy.tasks if t.status == "in_progress"]
+        for t in stuck:
+            t.status = "pending"
+        if stuck:
+            strategy.add_log(
+                "system",
+                f"--resume: {len(stuck)} task(s) were stuck in_progress from an "
+                f"interrupted run ({', '.join(t.id for t in stuck)}); reset to pending.",
+            )
+            ui.console.print(f"[cyan]Reset {len(stuck)} interrupted task(s) back to pending.[/cyan]")
 
         if args.retry_blocked:
             blocked = strategy.blocked_tasks()

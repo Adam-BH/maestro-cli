@@ -63,6 +63,21 @@ def commit_all(message: str, cwd: Optional[str] = None) -> Optional[str]:
     return _run(["rev-parse", "HEAD"], cwd=cwd).stdout.strip()
 
 
+def commit_paths(paths: List[str], message: str, cwd: Optional[str] = None) -> Optional[str]:
+    """Stage and commit only the given paths, leaving any other dirty/staged
+    state in the working tree untouched. Used to checkpoint STRATEGY.md on
+    every save regardless of whatever (possibly incomplete, unapproved)
+    code changes a Coder/Tester attempt has left lying around — those still
+    only get committed via commit_all, at approval or --commit-every-attempt.
+    Returns the new commit SHA, or None if those paths had nothing to commit."""
+    _run(["add", "--", *paths], cwd=cwd)
+    unstaged = _run(["diff", "--cached", "--quiet", "--", *paths], cwd=cwd, check=False)
+    if unstaged.returncode == 0:
+        return None
+    _run(["commit", "-m", message, "--", *paths], cwd=cwd)
+    return _run(["rev-parse", "HEAD"], cwd=cwd).stdout.strip()
+
+
 def diff_stat(cwd: Optional[str] = None, ref: str = "HEAD") -> str:
     proc = _run(["diff", "--stat", ref], cwd=cwd, check=False)
     return proc.stdout.strip()

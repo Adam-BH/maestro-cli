@@ -98,6 +98,17 @@ class Loop:
 
     def save(self) -> None:
         self.strategy.save(self.config.strategy_path)
+        # Commit STRATEGY.md on its own, independent of commit_every_attempt
+        # or task approvals — this is the run's entire memory, and losing it
+        # to a crash/reset shouldn't be possible just because a task's code
+        # isn't ready to commit yet. Scoped to this one path (see
+        # commit_paths) so it never sweeps up unrelated dirty/staged files.
+        if not self.strategy.no_commit:
+            git_utils.commit_paths(
+                [self.config.strategy_path],
+                f"[checkpoint] STRATEGY.md — iteration {self.strategy.iteration}",
+                cwd=self.cwd,
+            )
 
     # -- live activity streaming --------------------------------------
 
@@ -213,12 +224,14 @@ class Loop:
         """Mark `task` rejected with `reason`. If retries are exhausted,
         marks it needs_human instead and returns the (outcome, reason) pair
         to return from run_task_cycle. Returns None if the caller should
-        retry (loop again) — used uniformly for REJECT verdicts, invocation
-        failures, and unparseable output, so a single transient CLI hiccup
-        gets the same chance to recover as a real REJECT does, instead of
-        being escalated to a human on the very first failure."""
+        retry (loop again) — used uniformly for REJECT verdicts and
+        producer invocation failures, so a single transient CLI hiccup gets
+        the same chance to recover as a real REJECT does, instead of being
+        escalated to a human on the very first failure."""
         task.status = "rejected"
         task.notes = reason
+        task.review_attempts = 0
+        task.last_producer_summary = ""
         if task.attempts >= self.config.max_task_retries:
             task.status = "needs_human"
             escalated = (
@@ -229,63 +242,112 @@ class Loop:
             return OUTCOME_NEEDS_HUMAN, escalated
         return None
 
+    def _retry_review_or_escalate(self, task: Task, reason: str) -> Optional[Tuple[str, str]]:
+        """Like _retry_or_escalate, but for a failure *in the Reviewer step
+        itself* (invocation error, unparseable output) rather than a real
+        REJECT verdict — the producer's work was never actually judged.
+        Tracked via review_attempts, a separate budget from the producer's
+        attempts, so a flaky reviewer call can't burn the Coder's retries or
+        trigger a pointless recode of already-fine work. Keeps the task in
+        pending_review while under budget, so the next loop iteration (or a
+        --resume) goes straight back to the Reviewer with the same
+        last_producer_summary instead of re-running the producer."""
+        task.review_attempts += 1
+        task.notes = reason
+        if task.review_attempts >= self.config.max_task_retries:
+            task.status = "needs_human"
+            escalated = (
+                f"Reviewer failed {task.review_attempts} time(s) on {task.id} without "
+                f"reaching a verdict (tooling/invocation issue — the {task.agent}'s work "
+                f"was never actually rejected). Last error: {reason}"
+            )
+            task.notes = escalated
+            task.last_producer_summary = ""
+            return OUTCOME_NEEDS_HUMAN, escalated
+        task.status = "pending_review"
+        return None
+
     def run_task_cycle(self, task: Task) -> Tuple[str, str]:
         """Drive one task through Coder -> Reviewer, retrying on REJECT *or*
-        on an invocation-level failure (subprocess crash, unparseable
-        output — plausibly transient, not necessarily a real problem with
-        the task) up to config.max_task_retries. Returns (outcome, reason)
-        where outcome is OUTCOME_APPROVED, OUTCOME_NEEDS_HUMAN, or
-        OUTCOME_RATE_LIMITED."""
+        on a producer invocation-level failure up to config.max_task_retries.
+        A Reviewer-side failure (invocation error, unparseable output) is
+        handled separately — see _retry_review_or_escalate — since it means
+        the producer's work was never actually judged: the task is left
+        pending_review with the producer's summary preserved, so the next
+        iteration (or a --resume after a crash mid-review) goes straight
+        back to the Reviewer instead of redoing work that was never
+        rejected. Returns (outcome, reason) where outcome is
+        OUTCOME_APPROVED, OUTCOME_NEEDS_HUMAN, or OUTCOME_RATE_LIMITED."""
 
         last_rejection: Optional[str] = task.notes if task.status == "rejected" else None
         producer = self.producers.get(task.agent, self.coder)
+        summary = task.last_producer_summary
 
         while True:
-            task.attempts += 1
-            task.status = "in_progress"
-            self.strategy.add_log("system", f"Attempt {task.attempts} on {task.id}: {task.title}")
-            self.save()
-
-            self.ui.set_agent(producer.name, f"{task.id} (attempt {task.attempts}/{self.config.max_task_retries})")
-            producer_ctx = AgentContext(
-                strategy_text=self.strategy.render(),
-                cwd=self.cwd,
-                extra={
-                    "task": task,
-                    "rejection_reason": last_rejection,
-                    "no_commit": self.strategy.no_commit,
-                },
-                constraints=self.strategy.constraints,
-            )
-            producer_result = producer.run(producer_ctx, on_event=self._event_logger(producer.name))
-            self.ui.record_call(producer_result.cost_usd, producer_result.num_turns)
-
-            if not producer_result.ok:
-                self.ui.clear_agent()
-                rl = self._rate_limit_text(producer_result)
-                if rl:
-                    task.status = "pending"
-                    task.attempts -= 1  # this attempt never really happened
-                    return OUTCOME_RATE_LIMITED, rl
-                self.ui.log(producer.name, f"ERROR: {producer_result.error_message}")
-                self.strategy.add_log(producer.name, f"{task.id}: invocation error: {producer_result.error_message}")
-                escalation = self._retry_or_escalate(task, f"{producer.name.capitalize()} invocation failed: {producer_result.error_message}")
-                if escalation:
-                    return escalation
-                last_rejection = task.notes
-                continue
-
-            producer_outcome = parse_agent_result(producer_result.result_text)
-            summary = producer_outcome.summary if producer_outcome else (producer_result.result_text or "")[-500:]
-            self.ui.log(producer.name, summary or "(no summary returned)")
-            self.strategy.add_log(producer.name, f"{task.id} attempt {task.attempts}: {summary}")
-
-            if self.config.commit_every_attempt and not self.strategy.no_commit:
-                sha = git_utils.commit_all(
-                    f"[checkpoint] {task.id} attempt {task.attempts}", cwd=self.cwd
+            if task.status == "pending_review":
+                self.strategy.add_log(
+                    "system",
+                    f"Re-reviewing {task.id} (review attempt {task.review_attempts + 1}/"
+                    f"{self.config.max_task_retries}) without re-running {producer.name} — "
+                    "its prior work was never rejected, only the review itself failed.",
                 )
-                if sha:
-                    self.commits.append((sha, f"[checkpoint] {task.id} attempt {task.attempts}"))
+                self.save()
+            else:
+                task.attempts += 1
+                task.review_attempts = 0
+                task.status = "in_progress"
+                self.strategy.add_log("system", f"Attempt {task.attempts} on {task.id}: {task.title}")
+                self.save()
+
+                self.ui.set_agent(producer.name, f"{task.id} (attempt {task.attempts}/{self.config.max_task_retries})")
+                producer_ctx = AgentContext(
+                    strategy_text=self.strategy.render(),
+                    cwd=self.cwd,
+                    extra={
+                        "task": task,
+                        "rejection_reason": last_rejection,
+                        "no_commit": self.strategy.no_commit,
+                    },
+                    constraints=self.strategy.constraints,
+                )
+                producer_result = producer.run(producer_ctx, on_event=self._event_logger(producer.name))
+                self.ui.record_call(producer_result.cost_usd, producer_result.num_turns)
+
+                if not producer_result.ok:
+                    self.ui.clear_agent()
+                    rl = self._rate_limit_text(producer_result)
+                    if rl:
+                        task.status = "pending"
+                        task.attempts -= 1  # this attempt never really happened
+                        return OUTCOME_RATE_LIMITED, rl
+                    self.ui.log(producer.name, f"ERROR: {producer_result.error_message}")
+                    self.strategy.add_log(producer.name, f"{task.id}: invocation error: {producer_result.error_message}")
+                    escalation = self._retry_or_escalate(task, f"{producer.name.capitalize()} invocation failed: {producer_result.error_message}")
+                    if escalation:
+                        return escalation
+                    last_rejection = task.notes
+                    continue
+
+                producer_outcome = parse_agent_result(producer_result.result_text)
+                summary = producer_outcome.summary if producer_outcome else (producer_result.result_text or "")[-500:]
+                self.ui.log(producer.name, summary or "(no summary returned)")
+                self.strategy.add_log(producer.name, f"{task.id} attempt {task.attempts}: {summary}")
+
+                if self.config.commit_every_attempt and not self.strategy.no_commit:
+                    sha = git_utils.commit_all(
+                        f"[checkpoint] {task.id} attempt {task.attempts}", cwd=self.cwd
+                    )
+                    if sha:
+                        self.commits.append((sha, f"[checkpoint] {task.id} attempt {task.attempts}"))
+
+                # Checkpoint before handing off to the Reviewer: if the
+                # Reviewer call itself crashes or gets interrupted, --resume
+                # should find this task pending_review with the summary
+                # intact, not stuck in_progress with the attempt's context
+                # gone (see main.py's stuck-in_progress recovery on resume).
+                task.last_producer_summary = summary
+                task.status = "pending_review"
+                self.save()
 
             self.ui.set_agent("reviewer", f"reviewing {task.id}")
             review_ctx = AgentContext(
@@ -305,15 +367,12 @@ class Loop:
                 self.ui.clear_agent()
                 rl = self._rate_limit_text(review_result)
                 if rl:
-                    task.status = "pending"
-                    task.attempts -= 1
-                    return OUTCOME_RATE_LIMITED, rl
+                    return OUTCOME_RATE_LIMITED, rl  # left pending_review; nothing to undo
                 self.ui.log("reviewer", f"ERROR: {review_result.error_message}")
                 self.strategy.add_log("reviewer", f"{task.id}: invocation error: {review_result.error_message}")
-                escalation = self._retry_or_escalate(task, f"Reviewer invocation failed: {review_result.error_message}")
+                escalation = self._retry_review_or_escalate(task, f"Reviewer invocation failed: {review_result.error_message}")
                 if escalation:
                     return escalation
-                last_rejection = task.notes
                 continue
 
             verdict = parse_verdict(review_result.result_text)
@@ -321,10 +380,9 @@ class Loop:
                 self.ui.log("reviewer", "ERROR: no parseable verdict")
                 self.strategy.add_log("reviewer", f"{task.id}: no parseable VERDICT in output.")
                 self.ui.clear_agent()
-                escalation = self._retry_or_escalate(task, "Reviewer did not return a parseable verdict.")
+                escalation = self._retry_review_or_escalate(task, "Reviewer did not return a parseable verdict.")
                 if escalation:
                     return escalation
-                last_rejection = task.notes
                 continue
 
             verdict_line = verdict.kind + (f": {verdict.reason}" if verdict.reason else "")
@@ -335,6 +393,8 @@ class Loop:
             if verdict.approved:
                 task.status = "done"
                 task.notes = ""
+                task.last_producer_summary = ""
+                task.review_attempts = 0
                 if not self.strategy.no_commit:
                     sha = git_utils.commit_all(f"[approved] {task.id}: {task.title}", cwd=self.cwd)
                     if sha:
@@ -344,9 +404,11 @@ class Loop:
             if verdict.needs_human:
                 task.status = "needs_human"
                 task.notes = verdict.reason
+                task.last_producer_summary = ""
                 return OUTCOME_NEEDS_HUMAN, verdict.reason
 
-            # REJECT
+            # REJECT — genuine code feedback; back to the producer for a
+            # real new attempt (this clears pending_review/review_attempts).
             escalation = self._retry_or_escalate(task, verdict.reason)
             if escalation:
                 return escalation

@@ -18,6 +18,12 @@ reject it instead and describe what's wrong.
 - Run the project's test suite (or the most relevant subset) if one
   exists. A task cannot be approved if it breaks existing tests, even if
   its own acceptance criteria are otherwise met.
+- If there's no test suite yet, verify by actually running the app (e.g.
+  `npm install`, then exercise the relevant endpoint/command). To check a
+  long-running process like a server, don't background it yourself with a
+  shell `&` — that trips the sandbox's command parser and the call fails.
+  Instead start it with the Bash tool's own `run_in_background` option,
+  `curl` it in a follow-up call, then `kill` it when done.
 - Check EVERY acceptance criterion individually. All must be satisfied to
   approve.
 - Use REJECT for anything the Coder can plausibly fix by itself on the
