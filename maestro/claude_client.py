@@ -76,9 +76,17 @@ def _truncate(text: str, limit: int = 160) -> str:
 # case-insensitively against error_message + result_text + stderr — this is
 # best-effort (the CLI doesn't expose a structured error code for it), so it
 # errs toward catching real limit messages over being exhaustive.
+#
+# "spend limit" / "monthly limit" cover the plan-level cap message
+# ("You've hit your monthly spend limit · raise it at ..."), which is
+# distinct from the per-minute "usage limit"/"rate limit" wording above and
+# was previously falling through to the generic invocation-error path —
+# burning a task's retry budget on every call instead of pausing the run.
 _RATE_LIMIT_PATTERNS = (
     r"usage limit",
     r"rate.?limit",
+    r"spend limit",
+    r"monthly limit",
     r"quota",
     r"too many requests",
     r"\b429\b",
@@ -118,7 +126,39 @@ def extract_resume_hint(text: str) -> Optional[str]:
         if m:
             return m.group(0).strip()
 
+    # Monthly spend-limit messages carry no machine-readable reset time at
+    # all — the CLI just says "monthly spend limit". Billing cycles reset
+    # on the 1st, so the 1st of next month UTC is a reasonable estimate: a
+    # scheduler polling this can wait until then instead of hammering the
+    # CLI every few minutes on an unknown hint.
+    if re.search(r"monthly", text, re.I):
+        now = datetime.now(timezone.utc)
+        year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+        reset = now.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return reset.strftime("%Y-%m-%d %H:%M UTC") + " (estimated monthly reset, not exact)"
+
     return None
+
+
+_RESUME_HINT_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})\s*UTC")
+
+
+def parse_resume_hint(hint: Optional[str]) -> Optional[datetime]:
+    """Best-effort inverse of extract_resume_hint(): pulls a concrete UTC
+    timestamp back out of a resume_after string, for a scheduler deciding
+    whether it's time to retry yet. Returns None for hints with no
+    parseable timestamp (e.g. "unknown — try again later" or a free-form
+    "try again in 2 hours") — callers should fall back to a fixed poll
+    interval in that case rather than trying to parse relative durations."""
+    if not hint:
+        return None
+    m = _RESUME_HINT_DATE_RE.search(hint)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 @dataclass

@@ -13,6 +13,7 @@ without installing the package)
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from config import DEFAULT_CONFIG
-from maestro import git_utils
+from maestro import git_utils, scheduler
 from maestro.claude_client import ClaudeCLINotFound
 from maestro.loop import Loop
 from maestro.strategy import Strategy
@@ -114,6 +115,48 @@ progress lives in STRATEGY.md (and, unless the mission was NO-COMMIT, in git his
         help="With --resume: reset any needs_human tasks back to pending (attempts=0) "
         "before continuing, so they get another shot after you've fixed whatever blocked them.",
     )
+
+    watch_p = subparsers.add_parser(
+        "watch",
+        help="Manage the watchdog that auto-resumes runs paused on a usage/rate limit.",
+        description="Register project directories for the watchdog, and manage the "
+        "background timer that periodically checks them and re-runs `maestro run "
+        "--resume` once a paused run's limit should have cleared.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  maestro watch add .                  Register the current project directory
+  maestro watch list                   Show registered projects and their status
+  maestro watch check                  Run one check pass now (what the timer calls)
+  maestro watch install                Install + start a systemd --user timer (every 15m)
+  maestro watch remove .                Unregister the current project directory
+  maestro watch uninstall              Stop and remove the timer
+
+Only run_status == rate_limited is handled here — a `blocked` run (parked
+needs_human tasks) needs a human decision, not a timer; see the prompt
+`maestro run` shows at the end of a blocked interactive run instead.
+""",
+    )
+    watch_sub = watch_p.add_subparsers(dest="watch_command", required=True)
+
+    watch_add = watch_sub.add_parser("add", help="Register a project directory for the watchdog.")
+    watch_add.add_argument("dir", nargs="?", default=".", help="Project directory (default: current directory).")
+
+    watch_remove = watch_sub.add_parser("remove", help="Unregister a project directory.")
+    watch_remove.add_argument("dir", nargs="?", default=".", help="Project directory (default: current directory).")
+
+    watch_sub.add_parser("list", help="List registered project directories and their current status.")
+    watch_sub.add_parser("check", help="Run one check pass over all registered projects now.")
+
+    watch_install = watch_sub.add_parser(
+        "install", help="Install and start a systemd --user timer that runs `maestro watch check` periodically."
+    )
+    watch_install.add_argument(
+        "--interval-minutes", type=int, default=15, help="How often the timer fires (default: 15)."
+    )
+
+    watch_sub.add_parser("uninstall", help="Stop and remove the systemd --user timer.")
+
     return p.parse_args(argv)
 
 
@@ -344,10 +387,174 @@ def preflight(ui: MaestroUI, mission: str, cwd: str, skip_prompts: bool) -> bool
     return True
 
 
+# -- watchdog management ------------------------------------------------
+
+
+def main_watch(args: argparse.Namespace) -> int:
+    if args.watch_command == "add":
+        target = str(Path(args.dir).expanduser().resolve())
+        if scheduler.add_project(target):
+            print(f"Watching {target} — the timer will auto-resume it if it ever pauses on a usage limit.")
+            return 0
+        if target in scheduler.load_watchlist():
+            print(f"{target} is already registered.")
+            return 0
+        print(f"{target} has no STRATEGY.md yet — run `maestro run` there first, then register it.")
+        return 1
+
+    if args.watch_command == "remove":
+        target = str(Path(args.dir).expanduser().resolve())
+        if scheduler.remove_project(target):
+            print(f"Stopped watching {target}.")
+        else:
+            print(f"{target} was not registered.")
+        return 0
+
+    if args.watch_command == "list":
+        dirs = scheduler.load_watchlist()
+        if not dirs:
+            print("No projects registered. Add one with `maestro watch add <dir>`.")
+            return 0
+        for d in dirs:
+            strategy_path = Path(d) / "STRATEGY.md"
+            if strategy_path.exists():
+                s = Strategy.load(str(strategy_path))
+                print(f"{d}  [status={s.run_status}, resume_after={s.resume_after or '(none)'}]")
+            else:
+                print(f"{d}  [STRATEGY.md missing]")
+        return 0
+
+    if args.watch_command == "check":
+        results = scheduler.check_all()
+        if not results:
+            print("No projects registered. Add one with `maestro watch add <dir>`.")
+            return 0
+        for r in results:
+            print(f"{r.project_dir}: {r.action} — {r.detail}")
+        return 0
+
+    if args.watch_command == "install":
+        print(scheduler.install_timer(interval_minutes=args.interval_minutes))
+        return 0
+
+    if args.watch_command == "uninstall":
+        print(scheduler.uninstall_timer())
+        return 0
+
+    return 1  # argparse's required=True on the subparser makes this unreachable
+
+
+# -- end-of-run reporting -------------------------------------------------
+
+_USAGE_HEADING_KEYWORDS = (
+    "usage", "getting started", "quick start", "quickstart",
+    "running", "run the", "how to run", "installation",
+)
+
+
+def _extract_usage_section(text: str) -> Optional[str]:
+    """Pulls a "Getting started"/"Usage"/"Run"-style section out of a
+    README rather than dumping the whole file — most READMEs bury run
+    instructions under one heading among several (features, license, ...)."""
+    headings = list(re.finditer(r"^(#{1,3})\s*(.+)$", text, re.M))
+    for i, h in enumerate(headings):
+        title = h.group(2).strip().lower()
+        if not any(k in title for k in _USAGE_HEADING_KEYWORDS):
+            continue
+        level = len(h.group(1))
+        end = len(text)
+        for nxt in headings[i + 1:]:
+            if len(nxt.group(1)) <= level:
+                end = nxt.start()
+                break
+        return text[h.start():end].strip()
+    return None
+
+
+def print_how_to_run(ui: MaestroUI, project_dir: str) -> None:
+    """Printed once, after a successful ('done') run — the "how do I
+    actually use the thing that just got built" answer, so a finished run
+    doesn't just end at a task checklist."""
+    p = Path(project_dir)
+    readme = next((p / n for n in ("README.md", "Readme.md", "readme.md") if (p / n).exists()), None)
+    if readme is not None:
+        section = _extract_usage_section(readme.read_text(encoding="utf-8")) or readme.read_text(encoding="utf-8")
+        ui.print_panel(f"How to run this app (from {readme.name})", section[:3000], style="green")
+        return
+
+    lines = [f"cd {project_dir}"]
+    pkg_path = p / "package.json"
+    if pkg_path.exists():
+        try:
+            scripts = json.loads(pkg_path.read_text(encoding="utf-8")).get("scripts", {})
+        except json.JSONDecodeError:
+            scripts = {}
+        lines.append("npm install")
+        if "start" in scripts:
+            lines.append("npm start")
+        if "test" in scripts:
+            lines.append("npm test    # run the test suite")
+    elif (p / "requirements.txt").exists() or (p / "pyproject.toml").exists():
+        lines.append("python3 -m venv .venv && source .venv/bin/activate")
+        lines.append("pip install -r requirements.txt" if (p / "requirements.txt").exists() else "pip install -e .")
+        entry = next((f for f in ("main.py", "app.py", "manage.py") if (p / f).exists()), None)
+        if entry:
+            lines.append(f"python {entry}")
+    else:
+        lines = [f"No README or recognizable package manifest found in {project_dir} to infer run instructions from."]
+
+    ui.print_panel("How to run this app", "\n".join(lines), style="green")
+
+
+def _handle_blocked_end(ui: MaestroUI, loop: Loop) -> str:
+    """Called when an interactive run ends `blocked` — unattended mode
+    parked one or more needs_human tasks and there was nothing else left to
+    work on. Previously the process just exited here, which reads as the
+    session having died rather than paused. Ask right here whether the
+    human has guidance to unblock it, and if so keep going immediately in
+    this same process instead of requiring a separate --resume invocation.
+    Skipped entirely for non-interactive runs (--yes, piped, or the
+    watchdog's own `run --resume --yes`) — see call site — since input()
+    would just hang forever there."""
+    while True:
+        blocked = loop.strategy.blocked_tasks()
+        if not blocked:
+            return loop.strategy.run_status
+
+        ui.print_panel(
+            f"Blocked — {len(blocked)} task(s) need human input",
+            "\n\n".join(f"{t.id}: {t.title}\n{t.notes}" for t in blocked),
+            style="bold red",
+        )
+        guidance = input(
+            "\nType guidance to unblock these and keep going now, "
+            "or press Enter to leave the run parked and exit: "
+        ).strip()
+        if not guidance:
+            return loop.strategy.run_status
+
+        for t in blocked:
+            t.status, t.attempts, t.review_attempts, t.notes = "pending", 0, 0, f"Human guidance: {guidance}"
+        loop.strategy.add_log("human", f"Guidance for {len(blocked)} blocked task(s): {guidance}")
+        loop.strategy.run_status = "in_progress"
+        loop.save()
+
+        with ui.live():
+            loop.run(
+                plan_only=False,
+                on_needs_human=lambda tid, reason: _handle_pause(ui, tid, reason),
+                unattended=True,
+            )
+
+
 # -- main --------------------------------------------------------------
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    if args.command == "watch":
+        return main_watch(args)
+
     cfg = build_config(args)
     ui = MaestroUI()
 
@@ -495,10 +702,14 @@ def main(argv=None) -> int:
             ui.console.print(f"  {t.id}: {t.title}")
         return 0
 
+    if loop.strategy.run_status == "blocked" and not args.yes and sys.stdin.isatty():
+        _handle_blocked_end(ui, loop)
+
     ui.print_final_summary(loop.strategy, ui.total_cost, ui.total_turns, loop.commits)
 
     status = loop.strategy.run_status
     if status == "done":
+        print_how_to_run(ui, target_dir)
         return 0
     if status == "rate_limited":
         return 3
