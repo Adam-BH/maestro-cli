@@ -1,3 +1,3 @@
-from .console import OrchestratorUI
+from .console import MaestroUI
 
-__all__ = ["OrchestratorUI"]
+__all__ = ["MaestroUI"]

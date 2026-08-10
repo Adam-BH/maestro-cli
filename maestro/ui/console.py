@@ -1,5 +1,5 @@
 """
-Rich-based terminal UI for AgentOrchestrator.
+Rich-based terminal UI for Maestro.
 
 Why `rich` over `textual`: this is a linear, mostly-blocking pipeline (one
 `claude -p` subprocess call runs to completion before the next agent
@@ -10,13 +10,27 @@ plain scrolling output when stdout isn't a real terminal (CI logs, piped
 output). If a future agent needs concurrent panes or keyboard-driven
 navigation, textual would be worth revisiting.
 
-`OrchestratorUI` owns a `Live` layout with three regions:
-  - a header showing which agent is currently running (with live streamed
-    activity — tool calls, assistant text/thinking — as it happens)
-  - a task checklist (rendered from the Strategy)
-  - a scrolling log/history panel
+`MaestroUI` owns a `Live` region with two panels — a header (current
+agent + live streamed activity summary + running stats) and a task
+checklist (rendered from the Strategy) — kept small on purpose. Activity
+log lines are NOT part of the Live redraw region: `log()` prints each one
+straight through the live console proxy (`Live.console`), which appends to
+the terminal's real, ordinary scrollback above the live-updating panels
+instead of a fixed-height panel that erases old lines on every redraw.
+That's what makes scrollback actually work — with everything crammed into
+one Live-managed panel, lines that scroll off are gone for good (Live
+erases and repaints its own region each frame; it doesn't just visually
+push content upward), not just off-screen.
 
-Resize handling: everything here is sized from `self.console.size` fresh
+When stdout isn't a real terminal (piped output, redirected to a file,
+CI logs), `Live` doesn't get to do incremental redraws at all — it ends up
+batching everything into one dump at process exit. Rather than let that
+happen, `live()` detects `not self.console.is_terminal` and skips
+constructing a `Live` entirely; `log()`/`set_agent()`/`clear_agent()` fall
+back to plain sequential `console.print()` calls, so output still streams
+line-by-line as it happens.
+
+Resize handling: panel sizes are recomputed from `self.console.size` fresh
 on every render, and every line of text is `no_wrap=True,
 overflow="ellipsis"` rather than left to wrap — so the live region's total
 height/width is always recomputed to fit the *current* terminal exactly
@@ -50,6 +64,8 @@ from rich.text import Text
 AGENT_COLORS = {
     "planner": "blue",
     "coder": "green",
+    "researcher": "cyan",
+    "tester": "bright_magenta",
     "reviewer": "yellow",
     "system": "magenta",
 }
@@ -81,13 +97,14 @@ class LogLine:
     text: str
 
 
-class OrchestratorUI:
+class MaestroUI:
     """Owns all terminal output for a run."""
 
-    def __init__(self, console: Optional[Console] = None, history_limit: int = 500):
+    def __init__(self, console: Optional[Console] = None, history_limit: int = 500, show_cost: bool = True):
         self.console = console or Console()
         self.history: list = []
         self.history_limit = history_limit
+        self.show_cost = show_cost
         self.current_agent: Optional[str] = None
         self.current_action: str = "idle"
         self.strategy = None  # set via attach_strategy
@@ -107,6 +124,16 @@ class OrchestratorUI:
 
     @contextmanager
     def live(self):
+        if not self.console.is_terminal:
+            # Not a real terminal (piped, redirected to a file, CI logs) —
+            # Live can't do incremental redraws here and ends up batching
+            # everything into one dump at process exit instead. Skip it;
+            # log()/set_agent()/clear_agent() already fall back to plain
+            # sequential console.print() when self._live is None.
+            self._live = None
+            yield self
+            return
+
         live = Live(
             self._render(),
             console=self.console,
@@ -158,7 +185,10 @@ class OrchestratorUI:
     def set_agent(self, agent: str, action: str = "running") -> None:
         self.current_agent = agent
         self.current_action = action
-        self._refresh()
+        if self._live is None:
+            self.console.print(f"[bold {agent_color(agent)}]▶ {agent.upper()}[/bold {agent_color(agent)}] — {action}")
+        else:
+            self._refresh()
 
     def clear_agent(self) -> None:
         self.current_agent = None
@@ -166,14 +196,22 @@ class OrchestratorUI:
         self._refresh()
 
     def log(self, agent: str, text: str) -> None:
-        # Collapse to one line before it ever reaches history — the Text
-        # objects at render time are already no_wrap/ellipsis, but keeping
-        # the stored string itself single-line too avoids a very long
-        # streamed snippet dominating history size for no visual benefit.
+        # Collapse to one line — long streamed snippets shouldn't dominate
+        # the line, and no_wrap rendering below assumes single-line text.
         text = " ".join(text.split())
         self.history.append(LogLine(agent=agent, text=text))
         if len(self.history) > self.history_limit:
             self.history = self.history[-self.history_limit:]
+
+        color = agent_color(agent)
+        line = Text(no_wrap=True, overflow="ellipsis")
+        line.append(f"{agent:>9} │ ", style=f"bold {color}")
+        line.append(text)
+        # Print through the live console proxy (or the plain console when
+        # there's no Live) so this lands in real, ordinary terminal
+        # scrollback instead of the bounded, erase-and-repaint Live region.
+        target = self._live.console if self._live is not None else self.console
+        target.print(line)
         self._refresh()
 
     def record_call(self, cost_usd: Optional[float], num_turns: Optional[int]) -> None:
@@ -206,17 +244,15 @@ class OrchestratorUI:
         else:
             status = Text("○ idle", style="dim", no_wrap=True, overflow="ellipsis")
 
-        cost_bit = f"${self.total_cost:.4f}" if self.total_cost else "$0.00"
-        stats = Text(
-            f"calls: {self.total_calls}   turns: {self.total_turns}   cost: {cost_bit}",
-            style="dim",
-            no_wrap=True,
-            overflow="ellipsis",
-        )
+        stats_text = f"calls: {self.total_calls}   turns: {self.total_turns}"
+        if self.show_cost:
+            cost_bit = f"${self.total_cost:.4f}" if self.total_cost else "$0.00"
+            stats_text += f"   cost: {cost_bit}"
+        stats = Text(stats_text, style="dim", no_wrap=True, overflow="ellipsis")
         border = agent_color(self.current_agent) if self.current_agent else "bright_black"
         return Panel(
             Group(status, stats),
-            title="AgentOrchestrator",
+            title="Maestro",
             border_style=border,
             box=box.ROUNDED,
         )
@@ -248,43 +284,22 @@ class OrchestratorUI:
         title = f"Plan — {done}/{total} done" if total else "Plan"
         return Panel(table, title=title, border_style="bright_black", box=box.ROUNDED)
 
-    def _render_log(self, max_rows: int) -> Panel:
-        max_rows = max(max_rows, 1)
-        lines = []
-        for entry in self.history[-max_rows:]:
-            color = agent_color(entry.agent)
-            t = Text(no_wrap=True, overflow="ellipsis")
-            t.append(f"{entry.agent:>9} │ ", style=f"bold {color}")
-            t.append(entry.text)
-            lines.append(t)
-        if not lines:
-            lines = [Text("(no activity yet)", style="dim")]
-        return Panel(Group(*lines), title="Activity", border_style="bright_black", box=box.ROUNDED)
-
     def _render(self) -> Group:
-        # True minimum footprint is 11 rows: header(4) + at least one task
-        # row plus its "N more" line plus borders(4) + one log line plus
-        # borders(3). Verified to never overflow at or above that height;
-        # below it there's nothing left to trim without dropping a panel.
+        # header(4) + task panel (2 border rows + N task rows + optional
+        # "N more" line). Live region only ever holds header + tasks now —
+        # the activity log prints straight to real scrollback via log(), so
+        # there's no shared height budget to juggle between two panels.
         term_h = self._term_height()
         header_h = 4  # 2 content lines + top/bottom border
-        log_min_h = 3  # 1 content line + top/bottom border, _render_log's own floor
 
-        budget = max(term_h - header_h, 6)  # for tasks + log panels combined
-        tasks_budget = max(budget - log_min_h, 3)
-
+        tasks_budget = max(term_h - header_h, 3)
         n_tasks = len(self.strategy.tasks) if self.strategy else 0
         reserve_for_more_line = 1 if n_tasks > 1 else 0
-        task_rows = max(1, min(n_tasks or 1, 8, tasks_budget - 2 - reserve_for_more_line))
-        tasks_h = task_rows + 2 + (1 if n_tasks > task_rows else 0)
-
-        log_panel_h = max(budget - tasks_h, log_min_h)
-        log_rows = max(log_panel_h - 2, 1)
+        task_rows = max(1, min(n_tasks or 1, 12, tasks_budget - 2 - reserve_for_more_line))
 
         return Group(
             self._render_header(),
             self._render_tasks(task_rows),
-            self._render_log(log_rows),
         )
 
     # -- one-off panels (used outside Live, or interleaved with it) ----
@@ -304,6 +319,15 @@ class OrchestratorUI:
     def print_error(self, message: str) -> None:
         self.console.print(Panel(message, title="Error", border_style="bold red", box=box.ROUNDED))
 
+    def print_plan_summary(self, tasks) -> None:
+        table = Table(title="Plan", show_header=True, header_style="bold cyan", box=box.ROUNDED)
+        table.add_column("Task")
+        table.add_column("Agent")
+        table.add_column("Title")
+        for t in tasks:
+            table.add_row(t.id, t.agent, t.title, style=agent_color(t.agent))
+        self.console.print(table)
+
     def print_final_summary(self, strategy, total_cost: float, total_turns: int, commits: list) -> None:
         done, total = strategy.progress()
         table = Table(title="Run Summary", show_header=True, header_style="bold cyan", box=box.ROUNDED)
@@ -315,7 +339,8 @@ class OrchestratorUI:
         table.add_row("Iterations", str(strategy.iteration))
         table.add_row("Commits made", str(len(commits)))
         table.add_row("Total turns", str(total_turns))
-        table.add_row("Total cost (est.)", f"${total_cost:.4f}")
+        if self.show_cost:
+            table.add_row("Total cost (est.)", f"${total_cost:.4f}")
         self.console.print(table)
 
         if commits:
