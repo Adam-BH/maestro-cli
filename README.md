@@ -1,7 +1,8 @@
-# AgentOrchestrator
+# Maestro
 
 A CLI tool that orchestrates multiple Claude Code agents — Planner, Coder,
-Reviewer, and any others you add — in a **plan → build → review** loop,
+Researcher, Tester, Reviewer, and any others you add — in a
+**plan → build → review** loop,
 driving everything through the `claude -p` headless CLI. State lives in a
 single human-readable `STRATEGY.md` at the repo root, which every agent
 reads and every loop step updates. You describe what you want built once,
@@ -10,10 +11,11 @@ task-by-task account of exactly where it got stuck and why.
 
 ## What this actually is
 
-AgentOrchestrator is not itself an AI — it has no model, no API key, no
+Maestro is not itself an AI — it has no model, no API key, no
 intelligence of its own. It's a thin Python **process manager** around
-Claude Code: every "agent" (Planner, Coder, Reviewer) is just a distinct
-system prompt plus a distinct tool scope, dispatched as a fresh, isolated
+Claude Code: every "agent" (Planner, Coder, Researcher, Tester, Reviewer)
+is just a distinct system prompt plus a distinct tool scope, dispatched as
+a fresh, isolated
 `claude -p ...` subprocess call. All the intelligence comes from Claude;
 everything this codebase owns is the *orchestration* around it — deciding
 who runs next, what context they get, when to retry, when to stop, and
@@ -25,15 +27,15 @@ That separation is deliberate and shows up everywhere in the code:
 - **Every agent call is stateless.** There's no long-lived conversation —
   each `claude -p` invocation gets a freshly rendered prompt built from
   `STRATEGY.md` plus whatever's specific to that call (the task at hand,
-  a rejection reason, ...) and returns once. `orchestrator/claude_client.py`
+  a rejection reason, ...) and returns once. `maestro/claude_client.py`
   is the only module that knows how to shell out to `claude` and parse
   what comes back; nothing else touches a subprocess.
 - **All continuity lives in one file, not in memory.** `STRATEGY.md` is
   the mission, the plan, every task's status, and a timestamped decision
   log — plain markdown, hand-editable, and reloaded fresh by
-  `orchestrator/strategy.py` on every `--resume`. Kill the process at any
+  `maestro/strategy.py` on every `--resume`. Kill the process at any
   point and nothing is lost; the next run just picks the file back up.
-- **Control flow is ordinary Python, not another prompt.** `orchestrator/
+- **Control flow is ordinary Python, not another prompt.** `maestro/
   loop.py` is the only place that decides "call the Coder next," "retry
   this task," or "stop the whole run" — it's plain, readable code you can
   step through, not something an LLM decides turn-by-turn. That's what
@@ -42,7 +44,7 @@ That separation is deliberate and shows up everywhere in the code:
   inside its turn isn't.
 - **Agents are data, not special cases.** A "new agent" is a system
   prompt file + a small subclass + one line of config — see [Extending
-  AgentOrchestrator](#extending-agentorchestrator) below. The loop
+  Maestro](#extending-maestro) below. The loop
   doesn't know or care how many agent types exist.
 
 ## How it works, start to finish
@@ -51,39 +53,56 @@ That separation is deliberate and shows up everywhere in the code:
 you describe a mission
         │
         ▼
-  Claude cleans up typos/phrasing (scope untouched)
+  Claude enhances your prompt (typos/phrasing fixed,
+  explicit constraints + no-commit extracted; scope untouched)
         │
         ▼
   you pick/confirm a project folder
         │
         ▼
    ┌─────────┐
-   │ Planner │  reads STRATEGY.md + repo, writes a task plan with
-   └────┬────┘  acceptance criteria back into STRATEGY.md
-        │
+   │ Planner │  reads STRATEGY.md + repo, writes a task plan —
+   └────┬────┘  each task gets acceptance criteria AND an
+        │       assigned agent (coder / researcher / tester)
         ▼
-   ┌─────────┐        REJECT (up to N retries)
-┌─▶│  Coder  │─────────────────────────────┐
-│  └────┬────┘                             │
-│       │ implements + commits             │
-│       ▼                                  │
-│  ┌──────────┐                            │
-│  │ Reviewer │──── APPROVE ──▶ next task  │
-│  └────┬─────┘                            │
-│       │                                  │
-│       └── NEEDS_HUMAN ──▶ pause, wait ───┘
-│                            for you
+   ┌────────────────────┐  REJECT (up to N retries)
+┌─▶│ Coder / Researcher  │───────────────────────────┐
+│  │ / Tester (per task) │                           │
+│  └─────────┬───────────┘                           │
+│            │ implements (+ commits, unless          │
+│            │ no-commit constraint is active)        │
+│            ▼                                        │
+│  ┌──────────┐                                       │
+│  │ Reviewer │──── APPROVE ──▶ next task            │
+│  └────┬─────┘                                       │
+│       │                                              │
+│       └── NEEDS_HUMAN ──▶ live alert, task parked,───┘
+│                            run continues unattended
 └── (loop back with rejection reason as context)
 ```
 
 ## Quick start
 
+Install it as a real command (recommended — `pipx` keeps it in its own
+isolated environment so it can't clash with other projects' dependencies):
+
 ```bash
-pip install -r requirements.txt   # just `rich`
-python -m orchestrator.main       # interactive: describe your mission
+pipx install .          # from a checkout of this repo
+# or: pip install .     # into your current environment/venv
+maestro run              # interactive: describe your mission, in the current directory
 ```
 
-Useful flags:
+Or run straight from a source checkout without installing anything:
+
+```bash
+pip install -r requirements.txt   # just `rich`
+python -m maestro.main run        # same as `maestro run` above
+```
+
+`run` is the only subcommand today; more may show up later (e.g. a
+dedicated `resume`) without breaking `maestro run`.
+
+Useful flags (all go after `run`, e.g. `maestro run --resume --yes`):
 
 - `--dir PATH` / `-C PATH` — project directory to build in (created + `git init`'d if missing). Without it, you're prompted interactively (default: current directory). With `--resume`, this is where the existing `STRATEGY.md` lives.
 - `--plan-only` / `--dry-run` — run only the Planner, print the plan, touch no code.
@@ -96,8 +115,8 @@ Useful flags:
 - `--pause-on-human` — stop and wait at a terminal prompt on every NEEDS_HUMAN. Default is unattended: park the task and move on (see below) — pass this to get the old always-wait behavior back.
 - `--retry-blocked` — with `--resume`, reset any parked (`needs_human`) tasks back to `pending` before continuing.
 
-AgentOrchestrator refuses to build a project inside its own source
-directory (detected by the presence of `orchestrator/main.py` +
+Maestro refuses to build a project inside its own source
+directory (detected by the presence of `maestro/main.py` +
 `agents/base.py` + `config.py`) — if you run it from there, it redirects to
 `~/Desktop/<slug-of-your-mission>` instead of mixing your project into this
 tool's code. Pass `--dir` explicitly to target anywhere else.
@@ -108,13 +127,18 @@ will offer to `git init` for you if you're not in one yet).
 ### Mission intake
 
 1. You type a free-text mission (typos and all), finished with an empty line.
-2. A one-shot `claude -p` call (`agents/prompts/mission_cleaner.md`, no
-   tools, tiny turn budget) tidies typos/phrasing **and** suggests a short
-   folder-name slug (e.g. "buld me a soduku app using react..." →
+2. A one-shot `claude -p` call (`agents/prompts/mission_enhancer.md`, no
+   tools, tiny turn budget) tidies typos/phrasing, extracts any explicit
+   constraints you stated (e.g. "don't commit anything", "use Python 3.9
+   only") and whether a no-commit constraint applies, **and** suggests a
+   short folder-name slug (e.g. "buld me a soduku app using react..." →
    `sudoku-react`) — it's told explicitly not to add or drop scope, just
-   clean up wording and name the thing. If this call fails for any reason,
-   your original wording is used unchanged and the folder name falls back
-   to a naive word-slug; it never blocks the run.
+   clean up wording, extract what you actually said, and name the thing.
+   Extracted constraints are fed into every agent's prompt for the whole
+   run, not just at intake. If this call fails for any reason, your
+   original wording is used unchanged with no constraints/no-commit flag
+   and the folder name falls back to a naive word-slug; it never blocks
+   the run.
 3. You're asked where the project should live (`choose_project_dir`),
    defaulting to a fresh subfolder named after that slug (auto-created +
    `git init`'d) rather than dumping into whatever directory you happened
@@ -131,15 +155,19 @@ under Assumptions for when this falls back). The only continuity between calls i
 whatever we feed back in as context, which is `STRATEGY.md`'s rendered
 text plus a couple of extra fields for the task at hand.
 
-`STRATEGY.md` has four sections, all parsed back into structured state by
-`orchestrator/strategy.py` (`Strategy.parse` / `Strategy.render` round-trip
+`STRATEGY.md` has five sections, all parsed back into structured state by
+`maestro/strategy.py` (`Strategy.parse` / `Strategy.render` round-trip
 losslessly):
 
 - **Mission** — your original free-text request, unchanged.
-- **Meta** — run status, iteration count, timestamps.
+- **Constraints** — explicit dos-and-don'ts extracted from the mission at
+  intake (or "(none)"), fed into every agent's prompt for the whole run.
+- **Meta** — run status, iteration count, timestamps, and whether a
+  no-commit constraint is active.
 - **Plan** — one `### Task N: title` block per task, each with a status
   (`pending` / `in_progress` / `done` / `rejected` / `needs_human`),
-  attempt count, and its acceptance criteria.
+  attempt count, its assigned agent (`coder` / `researcher` / `tester`),
+  and its acceptance criteria.
 - **Decision Log** — an append-only, timestamped trail of what each agent
   did (`- [timestamp] (agent) message`), so you can read the file mid-run
   and understand exactly what happened without digging through logs.
@@ -148,35 +176,47 @@ Because it's plain markdown, you can open it during a paused run, read
 what went wrong, hand-edit a task's acceptance criteria if the Planner got
 something wrong, and `--resume`.
 
-## The loop and gating logic (`orchestrator/loop.py`)
+## The loop and gating logic (`maestro/loop.py`)
 
 1. **Plan** (once, at the start of a run, unless `--resume` finds an
    existing plan): Planner gets the current `STRATEGY.md` and repo
-   context, returns a `PLAN: ... END_PLAN` block, which is parsed into
-   `Task` objects and written back into `STRATEGY.md`.
+   context, returns a `PLAN: ... END_PLAN` block — one task per entry,
+   each assigned to `coder`, `researcher`, or `tester` depending on what
+   kind of work it is — which is parsed into `Task` objects and written
+   back into `STRATEGY.md`. A plan-summary table (task, agent, title)
+   prints before execution starts, so you see the whole plan up front.
 2. **For each pending/rejected task**, run a cycle:
-   - **Coder** gets the task, its acceptance criteria, and (on a retry)
-     the previous rejection reason. It implements the change and commits
-     it itself with a descriptive message.
-   - The orchestrator checkpoint-commits too (always after an APPROVE;
-     optionally after every attempt with `--commit-every-attempt`) as a
-     safety net in case the Coder's own commit didn't happen cleanly.
-   - **Reviewer** gets the task, the acceptance criteria, and the Coder's
-     summary, inspects the actual diff and runs tests itself (it never
-     trusts the summary alone), and returns one of:
-     - `APPROVE` → task marked `done`, checkpoint commit, move to next task.
-     - `REJECT: <reason>` → task marked `rejected`, looped back to Coder
-       with that reason as context. After `max_task_retries` rejections,
-       escalates to `NEEDS_HUMAN` automatically so a bad task can't retry
-       forever.
+   - Whichever agent the Planner assigned (**Coder**, **Researcher**, or
+     **Tester**) gets the task, its acceptance criteria, and (on a retry)
+     the previous rejection reason. Coder/Tester implement the change and
+     commit it with a descriptive message; Researcher is read-only and
+     reports findings instead. Unless a no-commit constraint is active
+     (see Mission intake above), in which case nothing is committed by
+     anyone and the changes stay in the working tree.
+   - Maestro checkpoint-commits too (always after an APPROVE, unless
+     no-commit is active; optionally after every attempt with
+     `--commit-every-attempt`) as a safety net in case the producing
+     agent's own commit didn't happen cleanly.
+   - **Reviewer** gets the task, the acceptance criteria, and the
+     producing agent's summary, inspects the actual diff (or, under
+     no-commit, the uncommitted working tree) and runs tests itself (it
+     never trusts the summary alone), and returns one of:
+     - `APPROVE` → task marked `done`, checkpoint commit (unless
+       no-commit), move to next task.
+     - `REJECT: <reason>` → task marked `rejected`, looped back to the
+       same agent with that reason as context. After `max_task_retries`
+       rejections, escalates to `NEEDS_HUMAN` automatically so a bad task
+       can't retry forever.
      - `NEEDS_HUMAN: <reason>` → task marked `needs_human` immediately.
-3. **On NEEDS_HUMAN** (default, unattended): the loop logs the reason,
-   leaves that task marked `needs_human`, and moves straight on to the
-   next pending task — a single bad task never stalls the rest of the
-   run, so you can start it and walk away. Once nothing pending/rejected
-   is left, the run stops with status `blocked` if anything is still
-   parked, or `done` if everything got through. The final summary lists
-   every parked task with its reason; fix what's needed and re-run with
+3. **On NEEDS_HUMAN** (default, unattended): the loop immediately shows a
+   prominent "⚠ NEEDS HUMAN INPUT" alert in the terminal so it can't get
+   lost in real-time scrollback, logs the reason, leaves that task marked
+   `needs_human`, and moves straight on to the next pending task — a
+   single bad task never stalls the rest of the run, so you can start it
+   and walk away. Once nothing pending/rejected is left, the run stops
+   with status `blocked` if anything is still parked, or `done` if
+   everything got through. The final summary also lists every parked task
+   with its reason; fix what's needed and re-run with
    `--resume --retry-blocked` to give them another shot. Pass
    `--pause-on-human` to go back to the old behavior — the loop stops and
    waits at a terminal prompt (`[r]etry` / `[q]uit`) on every single one.
@@ -199,45 +239,55 @@ something wrong, and `--resume`.
 A global `max_total_iterations` cap exists purely as a backstop against a
 pathological plan — it should never realistically be hit.
 
-## Terminal UI (`orchestrator/ui/console.py`)
+## Terminal UI (`maestro/ui/console.py`)
 
 Built on `rich`, not `textual`. This loop is a **linear, blocking
 pipeline** — one `claude -p` subprocess runs to completion before the next
 agent starts — not an app with concurrent input or navigable screens.
-`rich.live.Live` gives a live-updating multi-panel view (current agent,
-task checklist, scrolling activity log, running cost/turn totals) for a
-fraction of the code `textual` would need, and it degrades gracefully to
-plain scrolling output when stdout isn't a real terminal. If a future
-agent needed concurrent panes or keyboard navigation, `textual` would be
-worth revisiting then.
+`rich.live.Live` manages a small, live-updating region (current agent +
+task checklist, running cost/turn totals) for a fraction of the code
+`textual` would need. If a future agent needed concurrent panes or
+keyboard navigation, `textual` would be worth revisiting then.
 
 Each agent has a fixed color used consistently everywhere: **Planner =
-blue, Coder = green, Reviewer = yellow**.
+blue, Coder = green, Researcher = cyan, Tester = bright magenta, Reviewer
+= yellow**.
+
+**Real scrollback, not a bounded panel.** Activity log lines print
+straight to ordinary terminal scrollback (through `Live`'s console proxy)
+instead of being confined to a fixed-height panel that erases old lines on
+every redraw — so you can actually scroll back and see what happened.
+When stdout isn't a real terminal (piped output, redirected to a file),
+`Live` is skipped entirely and everything falls back to plain sequential
+prints, so output still streams incrementally instead of only appearing
+in one dump at process exit.
 
 **Live activity, not just final results.** Agent calls run with
 `--output-format stream-json --verbose` and a per-event callback
 (`Loop._event_logger` → `claude_client.summarize_stream_event`), so tool
 calls (`→ Bash(pytest ...)`, `→ Edit(app.py)`), assistant reasoning text,
-and thinking blocks show up in the Activity panel as they happen, not only
-after the whole call finishes. The plain `json` blocking path still exists
-(`ClaudeClient.run()` without `on_event=`) for calls nobody's watching,
-like the mission cleanup pass.
+and thinking blocks show up as they happen, not only after the whole call
+finishes. The plain `json` blocking path still exists (`ClaudeClient.run()`
+without `on_event=`) for calls nobody's watching, like the prompt-enhancer
+pass.
 
-**Resize-safe by construction.** Every panel's size is recomputed from
-`self.console.size` on every single render (region heights budgeted so
-header + tasks + log never together exceed the terminal's actual height —
-see `OrchestratorUI._render()`), and every line of text is
-`no_wrap=True, overflow="ellipsis"` rather than left to wrap. That
-combination is what actually matters for Rich's `Live`: it redraws by
-erasing exactly as many lines as the *previous* frame took, so if a resize
-changes how many lines something wraps into, or the live region ever grows
-taller than the terminal, that erase math goes stale and you get
-duplicated/glitchy output. Forcing single-line-or-ellipsis text and a
-height that's always ≤ the terminal's sidesteps both causes. A `SIGWINCH`
-handler additionally forces an immediate `Live.refresh()` the instant a
-resize happens, instead of waiting up to `1/refresh_per_second`.
+**Cost is only shown when it's real.** The dollar figure in the header and
+final summary reflects `--bare`/API-key billing; under OAuth/subscription
+auth it's hidden (calls/turns still show), since it isn't a real charge.
 
-## Extending AgentOrchestrator
+**Resize-safe by construction.** Panel sizes are recomputed from
+`self.console.size` on every single render (see `MaestroUI._render()`),
+and every line of text is `no_wrap=True, overflow="ellipsis"` rather than
+left to wrap. That combination is what actually matters for Rich's `Live`:
+it redraws by erasing exactly as many lines as the *previous* frame took,
+so if a resize changes how many lines something wraps into, or the live
+region ever grows taller than the terminal, that erase math goes stale and
+you get duplicated/glitchy output. Forcing single-line-or-ellipsis text
+and a height that's always ≤ the terminal's sidesteps both causes. A
+`SIGWINCH` handler additionally forces an immediate `Live.refresh()` the
+instant a resize happens, instead of waiting up to `1/refresh_per_second`.
+
+## Extending Maestro
 
 Everything here is built so a new agent type, a tweak to an existing
 one's behavior, or a new gating rule is a small, local change — not a
@@ -249,14 +299,14 @@ well-isolated, pattern-following project it's good at extending.
 
 | You want to... | Touch this |
 |---|---|
-| Change what a Planner/Coder/Reviewer is told to do | `agents/prompts/<name>.md` — plain text, no code |
+| Change what a Planner/Coder/Researcher/Tester/Reviewer is told to do | `agents/prompts/<name>.md` — plain text, no code |
 | Add a brand new agent (Security review, Docs pass, ...) | New prompt file + small class, see below |
 | Change an agent's tool access or turn budget | `config.py`'s `Config.agents` dict |
-| Change retry counts, iteration caps, model, `--bare` | `config.py`'s `Config` dataclass, or the matching CLI flag in `orchestrator/main.py` |
-| Change *when* an agent runs, or add a step to the cycle | `orchestrator/loop.py`'s `run_task_cycle` / `run` |
+| Change retry counts, iteration caps, model, `--bare` | `config.py`'s `Config` dataclass, or the matching CLI flag in `maestro/main.py` |
+| Change *when* an agent runs, or add a step to the cycle | `maestro/loop.py`'s `run_task_cycle` / `run` |
 | Change what counts as APPROVE/REJECT/NEEDS_HUMAN | The relevant `agents/prompts/*.md` (the model decides) — the *parsing* of that verdict is `agents/reviewer.py`'s `parse_verdict` |
-| Change the STRATEGY.md format itself | `orchestrator/strategy.py` — `render()`/`parse()` are the only two places that need to agree |
-| Change the terminal UI | `orchestrator/ui/console.py` — self-contained, nothing else imports `rich` directly |
+| Change the STRATEGY.md format itself | `maestro/strategy.py` — `render()`/`parse()` are the only two places that need to agree |
+| Change the terminal UI | `maestro/ui/console.py` — self-contained, nothing else imports `rich` directly |
 
 ### Adding a new agent type, by hand
 
@@ -282,8 +332,9 @@ a Docs agent). Steps:
            ...  # pull whatever you need out of context.extra
    ```
    Add a small parser function for its structured output, same pattern as
-   `parse_verdict` (`agents/reviewer.py`) or `parse_coder_result`
-   (`agents/coder.py`) — regex out whatever block you told it to end its
+   `parse_verdict` (`agents/reviewer.py`) or `parse_agent_result`
+   (`agents/coder.py` — shared by Coder/Researcher/Tester's identical
+   `RESULT:` block) — regex out whatever block you told it to end its
    message with.
 3. **Register its tool scope and turn budget** in `config.py`'s
    `Config.agents` dict (`AgentToolConfig(allowed_tools=..., max_turns=...)`).
@@ -300,12 +351,12 @@ a Docs agent). Steps:
 
 ### Adding a new agent type, by prompting Claude Code
 
-Since AgentOrchestrator's own source is a normal, readable git repo,
+Since Maestro's own source is a normal, readable git repo,
 you don't have to write the class and prompt file yourself — open Claude
 Code in this directory (`claude` from the repo root, or continue this
 session) and hand it something like:
 
-> Add a new agent called `Security` to AgentOrchestrator, following the
+> Add a new agent called `Security` to Maestro, following the
 > exact pattern of the existing Planner/Coder/Reviewer agents (see
 > `agents/base.py`, `agents/reviewer.py`, and `agents/prompts/reviewer.md`
 > as the closest reference — it's also read-only and returns a verdict).
@@ -316,7 +367,7 @@ session) and hand it something like:
 > or `VERDICT: FAIL: <reason>`. On FAIL, treat the task like a Reviewer
 > REJECT (send it back to the Coder with that reason, subject to the same
 > `max_task_retries`). Wire it into `config.py`'s `Config.agents` and into
-> `Loop` in `orchestrator/loop.py`. Don't change the Planner/Coder/Reviewer
+> `Loop` in `maestro/loop.py`. Don't change the Planner/Coder/Reviewer
 > classes or `main.py`.
 
 Being specific about **where it slots into the cycle** and **what its
@@ -340,12 +391,15 @@ failure or a surprising verdict after the fact.
   iterate task-by-task," so that's what's implemented. `plan_step()` is a
   separate method and easy to call again mid-run if you want a
   re-planning agent later.
-- **Both the Coder and the orchestrator commit.** The Coder is prompted to
-  make its own descriptive commit (per spec: "commits its work to git
-  with a descriptive message"). The orchestrator *also* does a checkpoint
-  commit after every approval (always) and optionally after every attempt
-  (`--commit-every-attempt`) as a safety net — if the Coder already
-  committed cleanly, this is a no-op (nothing left to commit).
+- **Both the producing agent and Maestro commit.** Coder/Tester are
+  prompted to make their own descriptive commit (per spec: "commits its
+  work to git with a descriptive message"). Maestro *also* does a
+  checkpoint commit after every approval (always) and optionally after
+  every attempt (`--commit-every-attempt`) as a safety net — if the
+  producing agent already committed cleanly, this is a no-op (nothing left
+  to commit). Exception: if the mission's extracted constraints include a
+  no-commit directive, neither commits anything for the whole run — see
+  Mission intake above.
 - **`claude -p` JSON field names**: the spec names `result`, `session_id`,
   `cost_usd`, and turn count. Field names have shifted across Claude Code
   versions, so `claude_client.py` accepts common aliases defensively
@@ -372,7 +426,7 @@ failure or a surprising verdict after the fact.
   before choosing "retry" (`--pause-on-human` mode) or `--retry-blocked`
   (default unattended mode).
 - **Rate-limit detection is best-effort text matching**, not a structured
-  error code from the CLI — `orchestrator/claude_client.py`'s
+  error code from the CLI — `maestro/claude_client.py`'s
   `is_rate_limited()` / `extract_resume_hint()` match on phrases like
   "usage limit"/"rate limit"/"quota"/429 and try to pull a reset time out
   of the message. If a future CLI version phrases limit errors
@@ -384,7 +438,7 @@ failure or a surprising verdict after the fact.
 ## Project layout
 
 ```
-orchestrator/
+maestro/
   main.py            entrypoint: mission intake, verification, kicks off the loop
   loop.py             plan -> code -> review loop controller, retry/gating logic
   claude_client.py     subprocess wrapper around `claude -p`, JSON + stream-json parsing
@@ -393,10 +447,12 @@ orchestrator/
   ui/console.py           rich-based terminal UI
 agents/
   base.py             Agent base class: loads its prompt file, runs it, logs the call
-  planner.py           produces the task plan
-  coder.py              implements one task, commits
+  planner.py           produces the task plan, assigns each task an agent
+  coder.py              implements one task, commits; shared RESULT: parser
+  researcher.py          investigates a task read-only, reports findings
+  tester.py              writes/extends/runs tests for one task, commits
   reviewer.py            APPROVE / REJECT / NEEDS_HUMAN against acceptance criteria
-  prompts/*.md          system prompts, one file per agent (including mission_cleaner.md)
+  prompts/*.md          system prompts, one file per agent (including mission_enhancer.md)
 config.py             model, retry limits, tool scopes, per-agent turn budgets
 start.sh              venv bootstrap + launcher — see Quick start
 requirements.txt / pyproject.toml   packaging
