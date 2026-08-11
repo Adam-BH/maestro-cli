@@ -34,6 +34,17 @@ class Planner(Agent):
         return prompt
 
 
+def parse_stack(text: str) -> str:
+    """Extract a STACK:...END_STACK block from Planner output, verbatim
+    (already bullet-formatted by the prompt) so it can be dropped straight
+    into STRATEGY.md's `## Stack` section. Returns "" if the Planner
+    didn't emit one (e.g. a revision that's deliberately keeping the
+    existing decision — see loop.py's plan_step, which only overwrites
+    Strategy.stack when this is non-empty)."""
+    m = re.search(r"STACK:\s*\n(.*?)\nEND_STACK", text, re.S)
+    return m.group(1).strip() if m else ""
+
+
 def parse_plan(text: str) -> List[Task]:
     """Extract a PLAN:...END_PLAN block from Planner output into Task objects."""
     m = re.search(r"PLAN:\s*\n(.*?)\nEND_PLAN", text, re.S)

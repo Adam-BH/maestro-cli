@@ -32,7 +32,7 @@ from typing import List, Optional, Tuple
 
 from agents.base import AgentContext
 from agents.coder import Coder, parse_agent_result
-from agents.planner import Planner, parse_plan
+from agents.planner import Planner, parse_plan, parse_stack
 from agents.researcher import Researcher
 from agents.reviewer import Reviewer, parse_verdict
 from agents.tester import Tester
@@ -207,6 +207,14 @@ class Loop:
                     return "failed"
                 continue
 
+            stack = parse_stack(result.result_text)
+            if stack:
+                # Preserve an already-established decision across plan
+                # revisions rather than letting a later Planner call
+                # silently overwrite it (planner.md tells it not to
+                # re-decide, but don't rely on that alone).
+                self.strategy.stack = stack
+
             tasks = parse_plan(result.result_text)
             if not tasks:
                 self.ui.log("planner", "ERROR: no parseable plan in output")
@@ -285,6 +293,40 @@ class Loop:
             return OUTCOME_NEEDS_HUMAN, escalated
         task.status = "pending_review"
         return None
+
+    def _run_deep_review(self, task: Task) -> None:
+        """Optional (--deep-review), additive-only pass: runs Claude Code's
+        own /code-review skill against the just-approved (not yet
+        committed) change and logs whatever it finds. Purely informational
+        — it never changes task status/verdict, since /code-review's
+        output isn't the strict APPROVE/REJECT/NEEDS_HUMAN contract the
+        rest of this loop gates on. Any failure (including /code-review
+        simply not firing under headless `-p`) is swallowed, same
+        tolerance as main.py's enhance_mission."""
+        if not self.config.deep_review:
+            return
+        tool_config = self.config.agents["deep_reviewer"]
+        self.ui.set_agent("deep_reviewer", f"code-review pass on {task.id}")
+        result = self.client.run(
+            prompt="/code-review",
+            allowed_tools=tool_config.allowed_tools,
+            max_turns=tool_config.max_turns,
+            permission_mode=tool_config.permission_mode,
+            cwd=self.cwd,
+            on_event=self._event_logger("deep_reviewer"),
+        )
+        self.ui.record_call(result.cost_usd, result.num_turns)
+        self.ui.clear_agent()
+
+        if not result.ok:
+            self.strategy.add_log(
+                "deep_reviewer", f"{task.id}: /code-review pass failed (non-blocking): {result.error_message}"
+            )
+            return
+
+        findings = (result.result_text or "").strip()
+        self.ui.log("deep_reviewer", findings[:500] if findings else "(no findings)")
+        self.strategy.add_log("deep_reviewer", f"{task.id}: {findings or '(no findings)'}")
 
     def run_task_cycle(self, task: Task) -> Tuple[str, str]:
         """Drive one task through Coder -> Reviewer, retrying on REJECT *or*
@@ -410,6 +452,7 @@ class Loop:
             self.ui.clear_agent()
 
             if verdict.approved:
+                self._run_deep_review(task)
                 task.status = "done"
                 task.notes = ""
                 task.last_producer_summary = ""

@@ -16,13 +16,15 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
 from config import DEFAULT_CONFIG
-from maestro import git_utils, scheduler
+from maestro import git_utils, scheduler, sessions
 from maestro.claude_client import ClaudeCLINotFound
 from maestro.loop import Loop
 from maestro.strategy import Strategy
@@ -55,6 +57,8 @@ Examples:
                                                     problem caused them to get stuck)
   maestro run --resume --pause-on-human            Resume, but stop at a terminal prompt on every
                                                     needs_human task instead of parking it and moving on
+  maestro run --detach                             Start a mission, then hand it off to the background --
+                                                    manage it afterward with `maestro sessions`
 
 A crash or Ctrl-C mid-run is always safe to recover from with `maestro run --resume` --
 progress lives in STRATEGY.md (and, unless the mission was NO-COMMIT, in git history).
@@ -104,11 +108,24 @@ progress lives in STRATEGY.md (and, unless the mission was NO-COMMIT, in git his
         help="Skip interactive confirmations (mission confirm, dirty-tree prompts). For scripted use.",
     )
     run_p.add_argument(
+        "--detach", action="store_true",
+        help="Do mission intake in this terminal, then hand the actual run off to a "
+        "background process and return immediately. Manage it afterward with "
+        "`maestro sessions list/attach/stop`.",
+    )
+    run_p.add_argument(
         "--pause-on-human", action="store_true",
         help="Stop and wait at a terminal prompt every time a task needs human input, "
         "like earlier versions did. Default is unattended: a blocked task is parked "
         "and the loop moves on to the next one, so a single bad task can't stall an "
         "overnight run.",
+    )
+    run_p.add_argument(
+        "--deep-review", action="store_true",
+        help="After the Reviewer approves a task, also run Claude Code's own "
+        "/code-review skill against the change as a supplementary, informational "
+        "pass — findings are logged to STRATEGY.md but never change a task's "
+        "verdict. Off by default (extra cost per approved task).",
     )
     run_p.add_argument(
         "--retry-blocked", action="store_true",
@@ -157,6 +174,25 @@ needs_human tasks) needs a human decision, not a timer; see the prompt
 
     watch_sub.add_parser("uninstall", help="Stop and remove the systemd --user timer.")
 
+    sessions_p = subparsers.add_parser(
+        "sessions",
+        help="List, tail, or interrupt runs started with `maestro run --detach`.",
+        description="Manage detached background runs registered by `maestro run --detach`.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  maestro sessions list             Show every detached session and its current status
+  maestro sessions attach <id>      Tail a session's live output (Ctrl-C just detaches, doesn't stop it)
+  maestro sessions stop <id>        Gracefully interrupt a session (same as pressing Ctrl-C on it)
+""",
+    )
+    sessions_sub = sessions_p.add_subparsers(dest="sessions_command", required=True)
+    sessions_sub.add_parser("list", help="List all detached sessions.")
+    sessions_attach = sessions_sub.add_parser("attach", help="Tail a session's live log output.")
+    sessions_attach.add_argument("id", help="Session id (see `maestro sessions list`).")
+    sessions_stop = sessions_sub.add_parser("stop", help="Gracefully interrupt a session.")
+    sessions_stop.add_argument("id", help="Session id (see `maestro sessions list`).")
+
     return p.parse_args(argv)
 
 
@@ -168,6 +204,7 @@ def build_config(args: argparse.Namespace):
     cfg.max_total_iterations = args.max_total_iterations
     cfg.commit_every_attempt = args.commit_every_attempt
     cfg.bare = args.bare
+    cfg.deep_review = args.deep_review
     return cfg
 
 
@@ -198,10 +235,82 @@ class MissionIntake:
     no_commit: bool = False
 
 
+@dataclass
+class ClarifyQuestion:
+    question: str
+    default: str
+
+
+def clarify_mission(ui: MaestroUI, client, cfg, mission: str) -> List[ClarifyQuestion]:
+    """One-shot `claude -p` pass that spots genuinely ambiguous points in
+    the raw mission and turns them into a handful of short questions with
+    sensible defaults. Falls back to no questions on any error or
+    unparseable output — this is a nicety, not something worth blocking
+    the run over (same tolerance as enhance_mission)."""
+    prompt_path = Path(cfg.prompts_dir) / "mission_clarifier.md"
+    system_prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
+
+    result = client.run(
+        prompt=f"Raw mission:\n\n{mission}",
+        allowed_tools="",
+        max_turns=cfg.mission_clarifier_max_turns,
+        permission_mode="acceptEdits",
+        system_prompt=system_prompt,
+    )
+    if not result.ok:
+        return []
+
+    m = re.search(r"QUESTIONS:\s*\n(.*?)\nEND_QUESTIONS", result.result_text, re.S)
+    if not m:
+        return []
+    block = m.group(1).strip()
+    if not block or block == "(none)":
+        return []
+
+    questions: List[ClarifyQuestion] = []
+    for line in block.splitlines():
+        line = line.strip().lstrip("- ").strip()
+        qm = re.match(r"Q:\s*(.+?)\s*\|\s*DEFAULT:\s*(.+)$", line)
+        if qm:
+            questions.append(ClarifyQuestion(question=qm.group(1).strip(), default=qm.group(2).strip()))
+    return questions
+
+
+def ask_clarifying_questions(ui: MaestroUI, questions: List[ClarifyQuestion]) -> List[tuple]:
+    """Interactively ask each question, Enter accepts the suggested
+    default. Returns (question, answer) pairs, folded into the mission
+    text before it goes to enhance_mission."""
+    if not questions:
+        return []
+    ui.console.print("\n[bold cyan]A few quick questions before I write this up:[/bold cyan]")
+    answers = []
+    for q in questions:
+        raw = input(f"  {q.question} [{q.default}]: ").strip()
+        answers.append((q.question, raw or q.default))
+    return answers
+
+
+def intake_mission(ui: MaestroUI, client, cfg, raw_mission: str, skip_prompts: bool) -> MissionIntake:
+    """Full mission intake: clarifying questions (skipped under --yes, or
+    silently skipped if the mission is already clear — see
+    mission_clarifier.md), then the refine pass. Answers are folded into
+    the text handed to enhance_mission so the resulting brief incorporates
+    them rather than just the original raw wording."""
+    mission = raw_mission
+    if not skip_prompts:
+        questions = clarify_mission(ui, client, cfg, raw_mission)
+        answers = ask_clarifying_questions(ui, questions)
+        if answers:
+            qa_block = "\n".join(f"- Q: {q} -> A: {a}" for q, a in answers)
+            mission = f"{raw_mission}\n\nClarifying answers:\n{qa_block}"
+    return enhance_mission(ui, client, cfg, mission)
+
+
 def enhance_mission(ui: MaestroUI, client, cfg, mission: str) -> MissionIntake:
-    """One-shot `claude -p` pass that tidies typos/phrasing in the raw
-    mission, extracts any constraints the user explicitly stated, and
-    suggests a folder-name slug. Falls back to the raw mission with no
+    """One-shot `claude -p` pass that expands the raw mission (plus any
+    clarifying answers folded in by intake_mission) into a structured
+    feature brief, extracts any constraints the user explicitly stated,
+    and suggests a folder-name slug. Falls back to the raw mission with no
     constraints/slug on any error — this is a nicety, not something worth
     blocking the run over."""
     prompt_path = Path(cfg.prompts_dir) / "mission_enhancer.md"
@@ -444,6 +553,116 @@ def main_watch(args: argparse.Namespace) -> int:
     return 1  # argparse's required=True on the subparser makes this unreachable
 
 
+# -- session detach/list/attach/stop -------------------------------------
+
+
+def _build_detach_command(cfg, target_dir: str) -> List[str]:
+    """The detached child re-enters exactly the --resume path (main.py's
+    existing crash-recovery machinery), just with --yes so it never blocks
+    on stdin that no longer has anyone attached to it."""
+    bin_cmd = scheduler._resolve_maestro_bin()
+    cmd = bin_cmd.split() + ["run", "--resume", "--yes", "-C", target_dir]
+    cmd += ["--model", cfg.model]
+    cmd += ["--max-task-retries", str(cfg.max_task_retries)]
+    cmd += ["--max-total-iterations", str(cfg.max_total_iterations)]
+    if cfg.commit_every_attempt:
+        cmd.append("--commit-every-attempt")
+    if not cfg.bare:
+        cmd.append("--no-bare")
+    if cfg.deep_review:
+        cmd.append("--deep-review")
+    return cmd
+
+
+def detach_run(ui: MaestroUI, cfg, target_dir: str) -> int:
+    """Spawns `maestro run --resume --yes` for `target_dir` as a background
+    process detached from this terminal (its own session via
+    start_new_session=True, so it survives the terminal closing) and
+    registers it in maestro/sessions.py so `maestro sessions
+    list/attach/stop` can find it afterward. The mission's STRATEGY.md must
+    already be saved to disk before this is called -- the child picks up
+    from exactly that state via --resume, reusing that machinery instead of
+    any new IPC or process-supervision model."""
+    log_dir = sessions.CONFIG_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    session_id = sessions.new_session_id(target_dir)
+    log_path = log_dir / f"{session_id}.log"
+    cmd = _build_detach_command(cfg, target_dir)
+
+    with open(log_path, "w", encoding="utf-8") as log_f:
+        log_f.write(f"# maestro session {session_id} detached at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+        log_f.write(f"# command: {' '.join(cmd)}\n\n")
+        log_f.flush()
+        proc = subprocess.Popen(
+            cmd, cwd=target_dir, stdout=log_f, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+
+    sessions.register(session_id, target_dir, proc.pid, str(log_path))
+    ui.print_panel(
+        "Detached",
+        f"Session:  {session_id}\n"
+        f"PID:      {proc.pid}\n"
+        f"Project:  {target_dir}\n"
+        f"Log:      {log_path}\n\n"
+        f"maestro sessions attach {session_id}   # tail live output (Ctrl-C just detaches)\n"
+        f"maestro sessions stop {session_id}     # gracefully interrupt it\n"
+        "maestro sessions list                  # see this and any other sessions",
+        style="green",
+    )
+    return 0
+
+
+def main_sessions(args: argparse.Namespace) -> int:
+    if args.sessions_command == "list":
+        infos = sessions.list_sessions()
+        if not infos:
+            print("No detached sessions. Start one with `maestro run --detach`.")
+            return 0
+        for info in infos:
+            state = "running" if info.alive else "exited"
+            done, total = info.progress
+            print(
+                f"{info.id}  [{state}]  status={info.run_status}  tasks={done}/{total}  "
+                f"dir={info.project_dir}  started={info.started_at}"
+            )
+        return 0
+
+    if args.sessions_command == "attach":
+        info = sessions.get_session(args.id)
+        if info is None:
+            print(f"No session {args.id!r} registered. See `maestro sessions list`.")
+            return 1
+        log_path = Path(info.log_path)
+        if not log_path.exists():
+            print(f"No log file yet at {log_path} -- the session may still be starting.")
+            return 1
+
+        print(f"Attached to {args.id} (pid {info.pid}) -- Ctrl-C detaches without stopping it.\n")
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            print(f.read(), end="")
+            try:
+                while True:
+                    line = f.readline()
+                    if line:
+                        print(line, end="")
+                        continue
+                    current = sessions.get_session(args.id)
+                    if current is None or not current.alive:
+                        print(f"\n[session {args.id} has exited]")
+                        return 0
+                    time.sleep(0.5)
+            except KeyboardInterrupt:
+                print(f"\nDetached. Session {args.id} keeps running in the background.")
+                return 0
+
+    if args.sessions_command == "stop":
+        print(sessions.stop_session(args.id))
+        return 0
+
+    return 1  # argparse's required=True on the subparser makes this unreachable
+
+
 # -- end-of-run reporting -------------------------------------------------
 
 _USAGE_HEADING_KEYWORDS = (
@@ -555,6 +774,9 @@ def main(argv=None) -> int:
     if args.command == "watch":
         return main_watch(args)
 
+    if args.command == "sessions":
+        return main_sessions(args)
+
     cfg = build_config(args)
     ui = MaestroUI()
 
@@ -618,12 +840,13 @@ def main(argv=None) -> int:
                 ui.console.print(f"[cyan]Reset {len(blocked)} blocked task(s) for retry.[/cyan]")
             strategy.resume_after = ""
     else:
+        ui.print_banner()
         raw_mission = prompt_mission(ui)
         if not raw_mission:
             ui.print_error("Empty mission, nothing to do.")
             return 1
 
-        intake = enhance_mission(ui, client, cfg, raw_mission)
+        intake = intake_mission(ui, client, cfg, raw_mission, skip_prompts=args.yes)
         mission, slug = intake.mission, intake.slug
         ui.print_mission(mission)
 
@@ -642,7 +865,7 @@ def main(argv=None) -> int:
                 if not raw_mission:
                     ui.print_error("Empty mission, nothing to do.")
                     return 1
-                intake = enhance_mission(ui, client, cfg, raw_mission)
+                intake = intake_mission(ui, client, cfg, raw_mission, skip_prompts=False)
                 mission, slug = intake.mission, intake.slug
                 ui.print_mission(mission)
                 continue
@@ -677,6 +900,9 @@ def main(argv=None) -> int:
             "crash mid-task loses whatever work wasn't yet Reviewer-approved.",
             style="yellow",
         )
+
+    if args.detach:
+        return detach_run(ui, cfg, target_dir)
 
     loop = Loop(cfg, strategy, ui, target_dir, client=client)
     unattended = not args.pause_on_human

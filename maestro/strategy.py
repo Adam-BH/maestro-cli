@@ -89,6 +89,12 @@ class Strategy:
     # by the prompt-enhancer pass at intake. Fed into every agent's prompt
     # so constraints are respected for the whole run, not just at intake.
     constraints: List[str] = field(default_factory=list)
+    # The Planner's tech-stack decision (language/runtime, framework, data
+    # layer, key libraries, rationale) as a rendered bullet block — set once
+    # by the first successful plan_step() and preserved across plan
+    # revisions so every subsequent agent builds on the same choice instead
+    # of each one improvising its own. Empty until the Planner has run.
+    stack: str = ""
     # Set when the mission explicitly says not to commit. Disables both the
     # Maestro's own checkpoint commits and the Coder/Tester's own
     # commit step for the whole run — see Loop.run_task_cycle.
@@ -130,6 +136,10 @@ class Strategy:
             lines += [f"- {c}" for c in self.constraints]
         else:
             lines.append("(none)")
+        lines.append("")
+
+        lines += ["## Stack", ""]
+        lines.append(self.stack.strip() if self.stack.strip() else "(not decided yet — Planner has not run)")
         lines.append("")
 
         lines += [
@@ -206,6 +216,12 @@ class Strategy:
                     for line in block.splitlines()
                     if line.strip().startswith("-")
                 ]
+
+        stack_match = re.search(r"^## Stack\s*\n+(.*?)(?=\n## )", text, re.S | re.M)
+        if stack_match:
+            block = stack_match.group(1).strip()
+            if block and block != "(not decided yet — Planner has not run)":
+                strategy.stack = block
 
         meta_match = re.search(r"^## Meta\s*\n+(.*?)(?=\n## )", text, re.S | re.M)
         if meta_match:

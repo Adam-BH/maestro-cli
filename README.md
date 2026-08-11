@@ -1,5 +1,14 @@
 # Maestro
 
+```
+█   █   ███   █████   ████  █████  ████    ███
+██ ██  █   █  █      █        █    █   █  █   █
+█ █ █  █████  ████    ███     █    ████   █   █
+█   █  █   █  █          █    █    █  █   █   █
+█   █  █   █  █████  ████     █    █   █   ███
+                autonomous Claude Code build loop
+```
+
 A CLI tool that orchestrates multiple Claude Code agents — Planner, Coder,
 Researcher, Tester, Reviewer, and any others you add — in a
 **plan → build → review** loop,
@@ -53,32 +62,41 @@ That separation is deliberate and shows up everywhere in the code:
 you describe a mission
         │
         ▼
-  Claude enhances your prompt (typos/phrasing fixed,
-  explicit constraints + no-commit extracted; scope untouched)
+  clarifying questions, if the mission is genuinely ambiguous
+  (skipped under --yes; a clear mission gets none at all)
+        │
+        ▼
+  Claude refines it into a feature brief — overview, core features,
+  and key user flows (only what you stated or implied — no invented scope)
         │
         ▼
   you pick/confirm a project folder
         │
         ▼
    ┌─────────┐
-   │ Planner │  reads STRATEGY.md + repo, writes a task plan —
-   └────┬────┘  each task gets acceptance criteria AND an
-        │       assigned agent (coder / researcher / tester)
-        ▼
-   ┌────────────────────┐  REJECT (up to N retries)
-┌─▶│ Coder / Researcher  │───────────────────────────┐
-│  │ / Tester (per task) │                           │
-│  └─────────┬───────────┘                           │
-│            │ implements (+ commits, unless          │
-│            │ no-commit constraint is active)        │
-│            ▼                                        │
-│  ┌──────────┐                                       │
-│  │ Reviewer │──── APPROVE ──▶ next task            │
-│  └────┬─────┘                                       │
-│       │                                              │
-│       └── NEEDS_HUMAN ──▶ live alert, task parked,───┘
-│                            run continues unattended
-└── (loop back with rejection reason as context)
+   │ Planner │  reads STRATEGY.md + repo, decides a tech stack (or
+   └────┬────┘  adopts an existing one), writes a task plan — each
+        │       task gets acceptance criteria AND an assigned agent
+        ▼       (coder / researcher / tester)
+   ┌────────────────────────┐
+┌─▶│  Coder / Researcher /  │
+│  │  Tester (per task)     │
+│  └────────────┬───────────┘
+│                │ implements (+ commits, unless
+│                │ no-commit constraint is active)
+│                ▼
+│         ┌──────────┐
+│         │ Reviewer │  optional --deep-review: Claude Code's own
+│         └────┬─────┘  /code-review also runs, informational only
+│              │
+│              ▼   one of three verdicts:
+│
+│   • APPROVE      → task done, move on to the next pending task
+│   • NEEDS_HUMAN   → task parked (NOT retried), loop moves on to the
+│                     next pending task anyway — unattended by default
+└── REJECT          → back to Coder/Researcher/Tester above, with the
+                       rejection reason as context (up to N retries,
+                       then this also escalates to NEEDS_HUMAN)
 ```
 
 ## Installation
@@ -171,6 +189,8 @@ Useful flags (all go after `run`, e.g. `maestro run --resume --yes`):
 - `-y` / `--yes` — skip interactive confirmations (mission confirm, dirty-tree prompts, project dir, git init); for scripted use.
 - `--pause-on-human` — stop and wait at a terminal prompt on every NEEDS_HUMAN. Default is unattended: park the task and move on (see below) — pass this to get the old always-wait behavior back.
 - `--retry-blocked` — with `--resume`, reset any parked (`needs_human`) tasks back to `pending` before continuing.
+- `--deep-review` — after the Reviewer approves a task, also run Claude Code's own `/code-review` skill as a supplementary, informational pass (findings are logged, never change the verdict). Off by default — extra cost per approved task.
+- `--detach` — do mission intake in this terminal, then hand the run off to the background and return immediately. See [Sessions: running missions in the background](#sessions-running-missions-in-the-background) below.
 
 Maestro refuses to build a project inside its own source
 directory (detected by the presence of `maestro/main.py` +
@@ -184,23 +204,34 @@ will offer to `git init` for you if you're not in one yet.
 ### Mission intake
 
 1. You type a free-text mission (typos and all), finished with an empty line.
-2. A one-shot `claude -p` call (`agents/prompts/mission_enhancer.md`, no
-   tools, tiny turn budget) tidies typos/phrasing, extracts any explicit
-   constraints you stated (e.g. "don't commit anything", "use Python 3.9
-   only") and whether a no-commit constraint applies, **and** suggests a
-   short folder-name slug (e.g. "buld me a soduku app using react..." →
-   `sudoku-react`) — it's told explicitly not to add or drop scope, just
-   clean up wording, extract what you actually said, and name the thing.
-   Extracted constraints are fed into every agent's prompt for the whole
-   run, not just at intake. If this call fails for any reason, your
-   original wording is used unchanged with no constraints/no-commit flag
-   and the folder name falls back to a naive word-slug; it never blocks
-   the run.
-3. You're asked where the project should live (`choose_project_dir`),
+2. A one-shot `claude -p` call (`agents/prompts/mission_clarifier.md`, no
+   tools, tiny turn budget) looks for anything genuinely ambiguous about
+   *this* mission — target platform, must-have vs. nice-to-have scope,
+   auth/persistence needs, a design direction, a deployment target — and
+   asks up to 5 short questions, each with a sensible suggested default
+   (Enter accepts it). A mission that's already clear gets zero questions;
+   this step is silent then, not padding for its own sake. Skipped
+   entirely under `--yes`.
+3. A one-shot `claude -p` call (`agents/prompts/mission_enhancer.md`, no
+   tools) turns the mission — plus any answers from step 2 — into a
+   structured feature brief: a one-line overview, a bulleted core-features
+   list, and key user flows if the mission is complex enough to warrant
+   them. It's told explicitly to make *implicit* scope explicit (e.g. "a
+   todo app" implies add/edit/delete/mark-done/persistence) without
+   inventing anything you didn't state or imply — no tech stack decisions
+   here, that's the Planner's job (see below). The same call also extracts
+   any explicit constraints you stated (e.g. "don't commit anything", "use
+   Python 3.9 only") and whether a no-commit constraint applies, **and**
+   suggests a short folder-name slug (e.g. "buld me a soduku app using
+   react..." → `sudoku-react`). Extracted constraints are fed into every
+   agent's prompt for the whole run, not just at intake. If either call
+   fails for any reason, it degrades gracefully (no questions asked /
+   your original wording used unchanged) rather than blocking the run.
+4. You're asked where the project should live (`choose_project_dir`),
    defaulting to a fresh subfolder named after that slug (auto-created +
    `git init`'d) rather than dumping into whatever directory you happened
    to be in.
-4. One confirmation: `[Y]es / [e]dit mission / [f]older / [q]uit`.
+5. One confirmation: `[Y]es / [e]dit mission / [f]older / [q]uit`.
    `y`/Enter starts the run; `--yes` skips this and just proceeds.
 
 ## Why STRATEGY.md is the source of truth
@@ -237,11 +268,18 @@ something wrong, and `--resume`.
 
 1. **Plan** (once, at the start of a run, unless `--resume` finds an
    existing plan): Planner gets the current `STRATEGY.md` and repo
-   context, returns a `PLAN: ... END_PLAN` block — one task per entry,
-   each assigned to `coder`, `researcher`, or `tester` depending on what
-   kind of work it is — which is parsed into `Task` objects and written
-   back into `STRATEGY.md`. A plan-summary table (task, agent, title)
-   prints before execution starts, so you see the whole plan up front.
+   context. It first decides the tech stack — adopting whatever's already
+   established in the repo, or, on a new/empty project, explicitly
+   choosing a language/runtime, framework, and data layer that actually
+   fits the mission and saying why — recorded in a `STACK: ... END_STACK`
+   block that's written into `STRATEGY.md`'s `## Stack` section and stays
+   there across plan revisions, so every later agent builds on the same
+   decision instead of each one improvising its own. It then returns a
+   `PLAN: ... END_PLAN` block — one task per entry, each assigned to
+   `coder`, `researcher`, or `tester` depending on what kind of work it is
+   — which is parsed into `Task` objects and written back into
+   `STRATEGY.md`. A plan-summary table (task, agent, title) prints before
+   execution starts, so you see the whole plan up front.
 2. **For each pending/rejected task**, run a cycle:
    - Whichever agent the Planner assigned (**Coder**, **Researcher**, or
      **Tester**) gets the task, its acceptance criteria, and (on a retry)
@@ -265,6 +303,12 @@ something wrong, and `--resume`.
        rejections, escalates to `NEEDS_HUMAN` automatically so a bad task
        can't retry forever.
      - `NEEDS_HUMAN: <reason>` → task marked `needs_human` immediately.
+   - With `--deep-review`: right after an `APPROVE`, before the checkpoint
+     commit, Claude Code's own `/code-review` skill also runs against the
+     change. This is purely additive and informational — its findings get
+     logged to `STRATEGY.md`'s Decision Log and shown in the terminal, but
+     never change the task's status. The Reviewer above remains the sole
+     gate on whether a task is actually `done`.
 3. **On NEEDS_HUMAN** (default, unattended): the loop immediately shows a
    prominent "⚠ NEEDS HUMAN INPUT" alert in the terminal so it can't get
    lost in real-time scrollback, logs the reason, leaves that task marked
@@ -295,6 +339,42 @@ something wrong, and `--resume`.
 
 A global `max_total_iterations` cap exists purely as a backstop against a
 pathological plan — it should never realistically be hit.
+
+## Sessions: running missions in the background
+
+`maestro run` normally blocks the terminal it's running in for the whole
+mission. `--detach` lets you do mission intake in that terminal as usual,
+then hand the actual run off to a background process and get your prompt
+back immediately — so you can start several missions from the same
+machine and check on each one independently, or close the terminal without
+killing the run.
+
+```bash
+maestro run --detach          # intake happens here, then it backgrounds itself
+maestro sessions list         # see every detached session and its live status
+maestro sessions attach <id>  # tail its output; Ctrl-C detaches without stopping it
+maestro sessions stop <id>    # gracefully interrupt it (same as pressing Ctrl-C on it)
+```
+
+This isn't a daemon or a new process-supervision model — it's a thin
+registry (`maestro/sessions.py`, `~/.config/maestro/sessions.json`) around
+machinery that already exists:
+
+- A detached session is just an ordinary `maestro run --resume --yes`
+  subprocess, launched in its own OS session (`start_new_session=True`) so
+  it survives the parent terminal closing, with its output redirected to a
+  log file under `~/.config/maestro/logs/`.
+- `maestro sessions list` reads that log's project directory's
+  `STRATEGY.md` directly for live status/progress, and checks the PID
+  (`os.kill(pid, 0)`) for whether it's still running — no state is
+  duplicated, `STRATEGY.md` stays the single source of truth.
+- `maestro sessions attach <id>` just tails that log file; detaching
+  again (Ctrl-C) only stops watching it, not the underlying run.
+- `maestro sessions stop <id>` sends `SIGINT` to the process — the exact
+  same signal a foreground Ctrl-C sends, which Maestro already handles by
+  saving `STRATEGY.md` and exiting cleanly (see [The loop and gating
+  logic](#the-loop-and-gating-logic-maestrolooppy) above). `--resume` picks
+  it back up from there, detached or not.
 
 ## Watchdog: auto-resuming a rate-limited run
 
@@ -609,7 +689,8 @@ maestro/
   strategy.py           STRATEGY.md <-> structured state, round-trip parse/render
   git_utils.py           commit checkpoints, diff summaries, clean-tree checks
   scheduler.py            watchdog: watchlist, one-shot check, systemd --user timer install
-  ui/console.py           rich-based terminal UI
+  sessions.py              --detach session registry: register/list/attach/stop
+  ui/console.py           rich-based terminal UI, incl. the startup banner
 agents/
   base.py             Agent base class: loads its prompt file, runs it, logs the call
   planner.py           produces the task plan, assigns each task an agent
@@ -617,7 +698,8 @@ agents/
   researcher.py          investigates a task read-only, reports findings
   tester.py              writes/extends/runs tests for one task, commits
   reviewer.py            APPROVE / REJECT / NEEDS_HUMAN against acceptance criteria
-  prompts/*.md          system prompts, one file per agent (including mission_enhancer.md)
+  prompts/*.md          system prompts, one file per agent, plus the intake
+                         passes (mission_clarifier.md, mission_enhancer.md)
 config.py             model, retry limits, tool scopes, per-agent turn budgets
 requirements.txt / pyproject.toml   packaging
 ```

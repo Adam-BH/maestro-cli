@@ -48,6 +48,11 @@ class Config:
     # git log readable (one commit per approved task).
     commit_every_attempt: bool = False
 
+    # After the Reviewer approves a task, also run Claude Code's own
+    # /code-review skill as a supplementary, informational pass (see
+    # Loop.run_task_cycle). Off by default — extra cost per approved task.
+    deep_review: bool = False
+
     # Run each agent with `claude -p --bare` (skips hooks/CLAUDE.md/MCP
     # config for reproducibility). NOTE: --bare only supports
     # ANTHROPIC_API_KEY auth (OAuth/keychain are never read in bare mode) —
@@ -67,8 +72,13 @@ class Config:
     prompts_dir: str = str(_PACKAGE_ROOT / "agents" / "prompts")
 
     # Turn budget for the one-shot prompt-enhancing pass at intake (no
-    # tools, pure text tidy-up + constraint extraction — kept tiny on purpose).
-    mission_enhancer_max_turns: int = 4
+    # tools, pure text — but now writing a structured feature brief rather
+    # than a typo pass, so a little more headroom than a pure tidy-up).
+    mission_enhancer_max_turns: int = 6
+
+    # Turn budget for the one-shot clarifying-questions pass at intake (no
+    # tools, pure text — kept tiny since it's just generating 0-5 questions).
+    mission_clarifier_max_turns: int = 4
 
     agents: dict = field(
         default_factory=lambda: {
@@ -102,6 +112,14 @@ class Config:
                 # here, not just requested in the prompt.
                 allowed_tools="Read,Glob,Grep,Bash",
                 max_turns=15,
+            ),
+            # Only invoked when --deep-review is passed, after the Reviewer
+            # already approved a task — an additive, informational pass via
+            # Claude Code's own /code-review skill. Read-only, same
+            # reasoning as reviewer above.
+            "deep_reviewer": AgentToolConfig(
+                allowed_tools="Read,Glob,Grep,Bash",
+                max_turns=20,
             ),
         }
     )

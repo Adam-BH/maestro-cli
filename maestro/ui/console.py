@@ -61,12 +61,28 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
+# Hand-built 5-row block-letter banner (not figlet output) so the column
+# alignment can be verified directly rather than trusted to a font file.
+# Padded to a fixed 47-column width explicitly (rather than relying on
+# literal trailing spaces surviving edits/whitespace-trimming) so every
+# row is guaranteed the same length — see the diagram fix in README.md
+# for why that verification matters here.
+_BANNER_ROWS = [
+    "█   █   ███   █████   ████  █████  ████    ███",
+    "██ ██  █   █  █      █        █    █   █  █   █",
+    "█ █ █  █████  ████    ███     █    ████   █   █",
+    "█   █  █   █  █          █    █    █  █   █   █",
+    "█   █  █   █  █████  ████     █    █   █   ███",
+]
+BANNER = "\n".join(row.ljust(49) for row in _BANNER_ROWS)
+
 AGENT_COLORS = {
     "planner": "blue",
     "coder": "green",
     "researcher": "cyan",
     "tester": "bright_magenta",
     "reviewer": "yellow",
+    "deep_reviewer": "bright_yellow",
     "system": "magenta",
 }
 
@@ -305,6 +321,16 @@ class MaestroUI:
         )
 
     # -- one-off panels (used outside Live, or interleaved with it) ----
+
+    def print_banner(self) -> None:
+        """Printed once at the start of a fresh interactive mission intake
+        (see main.py's prompt_mission) — never on --resume or a detached
+        session's --resume --yes re-exec, so it never lands in a tailable
+        session log or scripted/unattended output."""
+        text = Text(BANNER, style="bold cyan")
+        self.console.print(text)
+        self.console.print(Text("autonomous Claude Code build loop", style="dim italic"))
+        self.console.print()
 
     def print_panel(self, title: str, body: str, style: str = "cyan") -> None:
         self.console.print(Panel(body, title=title, border_style=style, box=box.ROUNDED))
