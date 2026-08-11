@@ -19,8 +19,8 @@ walk away, and come back to either a finished project or a clear,
 task-by-task account of exactly where it got stuck and why.
 
 New here? [TUTORIAL.md](TUTORIAL.md) is a hands-on walkthrough (first
-mission, detaching/checking on sessions, the watchdog); this README is the
-reference.
+mission, detaching/checking on sessions, running tasks in parallel across
+branches, the watchdog); this README is the reference.
 
 ## What this actually is
 
@@ -163,6 +163,27 @@ maestro --help
 ### Updating / uninstalling
 
 ```bash
+maestro update
+```
+
+Pulls `origin/main` into whatever's actually installed, working out how
+you installed it rather than assuming:
+
+- **An editable install** (`pipx install --editable .` / `pip install -e .`
+  from a local clone, e.g. the source contribution path above) — this is
+  detected by walking up from the running code looking for a `.git`
+  directory, which only exists for an editable install (a non-editable
+  one runs a *copy* sitting inside a venv, with no `.git` ancestor
+  nearby). Refuses if that checkout has uncommitted changes; otherwise
+  fetches + fast-forwards only (never rewrites history out from under
+  you) and takes effect immediately — no reinstall needed.
+- **A non-editable pipx install** — falls back to `pipx upgrade maestro`.
+- **Anything else** — prints the exact manual command instead of
+  guessing.
+
+Manual equivalents, if you'd rather do it yourself:
+
+```bash
 pipx upgrade maestro
 # or force-reinstall the latest commit:
 pipx install --force git+https://github.com/Adam-BH/maestro-cli.git
@@ -195,6 +216,9 @@ Useful flags (all go after `run`, e.g. `maestro run --resume --yes`):
 - `--retry-blocked` — with `--resume`, reset any parked (`needs_human`) tasks back to `pending` before continuing.
 - `--deep-review` — after the Reviewer approves a task, also run Claude Code's own `/code-review` skill as a supplementary, informational pass (findings are logged, never change the verdict). Off by default — extra cost per approved task.
 - `--detach` — do mission intake in this terminal, then hand the run off to the background and return immediately. See [Sessions: running missions in the background](#sessions-running-missions-in-the-background) below.
+- `--no-skill` — don't auto-generate a `.claude/skills/<slug>/SKILL.md` for the finished project once the mission is done (on by default — see [Auto-generated project skill](#auto-generated-project-skill) below).
+- `--fanout N` — split an already-planned project's pending tasks evenly across N git worktrees/branches and run them as N parallel detached sessions instead of one run in this directory. See [Running tasks in parallel across branches](#running-tasks-in-parallel-across-branches) below.
+- `--push-on-done` — push the current git branch to its remote once the mission finishes successfully (set automatically by `--fanout`; usable standalone too).
 
 Maestro refuses to build a project inside its own source
 directory (detected by the presence of `maestro/main.py` +
@@ -205,6 +229,20 @@ tool's code. Pass `--dir` explicitly to target anywhere else.
 Also requires a git repository at the target project dir — the tool
 will offer to `git init` for you if you're not in one yet.
 
+### Before any of this: are you actually logged in?
+
+Right after Maestro finds the `claude` binary on `PATH`, it makes one
+cheap, tool-free probe call to confirm you're actually authenticated —
+not just that the binary exists. `claude` missing entirely and `claude`
+present-but-logged-out are different failures: the first is caught
+immediately at startup either way; without this check, the second used
+to fail silently inside the clarifying-questions/refine calls below
+(both tolerate failures as a nicety-skip) and only turn into a confusing
+wall of failed tasks once the Planner/Coder started running. Now, if
+you're not logged in, Maestro tells you exactly what it detected and how
+to fix it (`claude /login` or `claude login`) and exits before any of the
+intake below runs — nothing is wasted figuring this out the hard way.
+
 ### Mission intake
 
 1. You type a free-text mission (typos and all), finished with an empty line.
@@ -213,9 +251,13 @@ will offer to `git init` for you if you're not in one yet.
    *this* mission — target platform, must-have vs. nice-to-have scope,
    auth/persistence needs, a design direction, a deployment target — and
    asks up to 5 short questions, each with a sensible suggested default
-   (Enter accepts it). A mission that's already clear gets zero questions;
-   this step is silent then, not padding for its own sake. Skipped
-   entirely under `--yes`.
+   (Enter accepts it). Each question shows in its own panel with a live
+   spinner while Claude's thinking, and an explicit "✓ Got it: ..."
+   confirmation once your answer registers, followed by a summary panel
+   of every question and answer before moving on — so you always have
+   visible proof of what was actually captured. A mission that's already
+   clear gets zero questions; this step is silent then, not padding for
+   its own sake. Skipped entirely under `--yes`.
 3. A one-shot `claude -p` call (`agents/prompts/mission_enhancer.md`, no
    tools) turns the mission — plus any answers from step 2 — into a
    structured feature brief: a one-line overview, a bulleted core-features
@@ -335,14 +377,40 @@ something wrong, and `--resume`.
    timestamp; otherwise "unknown — try again later"). The task in flight
    is put back to `pending` with its attempt not counted, so `--resume`
    retries it cleanly once the limit clears.
-5. **When every task is `done`**, the loop prints a summary (tasks
-   completed, commits made, total turns/cost) and exits 0. Exit code is
-   `2` for `blocked`/`failed`, `3` for `rate_limited` — useful if you're
-   scripting this (e.g. a cron job that checks the exit code and only
-   re-invokes `--resume` after the resume-after time has passed).
+5. **When every task is `done`**, one last one-time pass runs before the
+   final summary: the **Skill Writer** agent explores the finished
+   project and writes `.claude/skills/<slug>/SKILL.md` — install/run/test
+   instructions specific to *this* app, committed automatically (unless
+   no-commit is active) — see [Auto-generated project
+   skill](#auto-generated-project-skill) below. Skip it with `--no-skill`.
+   The loop then prints a summary (tasks completed, commits made, total
+   turns/cost) and exits 0. Exit code is `2` for `blocked`/`failed`, `3`
+   for `rate_limited` — useful if you're scripting this (e.g. a cron job
+   that checks the exit code and only re-invokes `--resume` after the
+   resume-after time has passed).
 
 A global `max_total_iterations` cap exists purely as a backstop against a
 pathological plan — it should never realistically be hit.
+
+## Auto-generated project skill
+
+Once every task is `done`, a **Skill Writer** agent (`agents/skillwriter.py`,
+`agents/prompts/skillwriter.md`) runs exactly once — Read/Glob/Grep/Write
+only, no Bash/Edit — and writes `.claude/skills/<slug>/SKILL.md` in the
+project it just built: install steps, run command, test command, and any
+real gotchas it actually found by reading the repo (README, package
+manifests, entry points), not guessed from the mission text alone. The
+slug is the project directory's own name. Committed automatically
+(unless the mission's no-commit constraint is active); any failure here
+is logged and swallowed, since this is a nicety on top of an
+already-successful run and must never turn a `done` mission into a
+failed one.
+
+The point: the next Claude Code session that opens in that repo — yours,
+or another `maestro run --resume` — gets packaged, project-specific
+instructions for free instead of having to rediscover them by reading
+the whole codebase again. Skip it with `--no-skill` if you don't want
+the extra agent call.
 
 ## Sessions: running missions in the background
 
@@ -356,8 +424,10 @@ killing the run.
 ```bash
 maestro run --detach          # intake happens here, then it backgrounds itself
 maestro sessions list         # see every detached session and its live status
-maestro sessions attach <id>  # tail its output; Ctrl-C detaches without stopping it
+maestro sessions attach <id>  # watch it live; Ctrl-C detaches without stopping it
 maestro sessions stop <id>    # gracefully interrupt it (same as pressing Ctrl-C on it)
+maestro sessions remove <id>  # forget a finished session's registry entry (log is kept)
+maestro sessions clean        # forget every finished session at once
 ```
 
 This isn't a daemon or a new process-supervision model — it's a thin
@@ -372,13 +442,86 @@ machinery that already exists:
   `STRATEGY.md` directly for live status/progress, and checks the PID
   (`os.kill(pid, 0)`) for whether it's still running — no state is
   duplicated, `STRATEGY.md` stays the single source of truth.
-- `maestro sessions attach <id>` just tails that log file; detaching
-  again (Ctrl-C) only stops watching it, not the underlying run.
+- `maestro sessions attach <id>` rebuilds the *same* header + live task
+  checklist a foreground `maestro run` shows, not a bare log tail: a
+  detached session's own stdout is a plain file, never a real terminal,
+  so it never gets Maestro's live-updating `Live` region of its own —
+  only flat activity-log lines land in the file. `attach` builds a fresh
+  `MaestroUI` against *your* terminal (which is a real one), polls that
+  project's `STRATEGY.md` for the task checklist, and tails the log file
+  underneath for the activity feed — so what you see is the real shell
+  view, reconstructed, not a stripped-down replay. Detaching again
+  (Ctrl-C) only stops watching it, not the underlying run.
 - `maestro sessions stop <id>` sends `SIGINT` to the process — the exact
   same signal a foreground Ctrl-C sends, which Maestro already handles by
   saving `STRATEGY.md` and exiting cleanly (see [The loop and gating
   logic](#the-loop-and-gating-logic-maestrolooppy) above). `--resume` picks
   it back up from there, detached or not.
+- `maestro sessions remove <id>` / `maestro sessions clean` drop a
+  finished session's entry from the registry (the log file itself is
+  left alone) — a session's registry entry otherwise sticks around
+  forever once it exits; nothing purges it automatically. `remove`
+  refuses on a still-running session (`stop` it first); `clean` sweeps
+  every non-running one in one go.
+- `maestro sessions push <id>` pushes that session's current branch to
+  its remote — mostly a manual escape hatch for `--fanout` sessions (see
+  below) that didn't auto-push, e.g. because you stopped one early.
+
+## Running tasks in parallel across branches
+
+Once a project is already planned (an existing `STRATEGY.md` with tasks
+in it — `--dry-run` is the quickest way to get there), you can split its
+remaining work across N branches and run them concurrently instead of
+one task at a time:
+
+```bash
+maestro run --resume --fanout 3 -C ~/Desktop/todo-app
+```
+
+```
+                       Fanned out across 3 branches
+╭───────────────────────┬──────────────────────────────┬────────────────┬────────╮
+│ Branch                │ Worktree                     │ Session        │ Tasks  │
+├───────────────────────┼──────────────────────────────┼────────────────┼────────┤
+│ maestro/todo-app-1    │ ~/Desktop/todo-app-fanout-1  │ todo-app-8f2a1c│ T1, T4 │
+│ maestro/todo-app-2    │ ~/Desktop/todo-app-fanout-2  │ todo-app-3d9e07│ T2, T5 │
+│ maestro/todo-app-3    │ ~/Desktop/todo-app-fanout-3  │ todo-app-c14b6a│ T3     │
+╰───────────────────────┴──────────────────────────────┴────────────────┴────────╯
+```
+
+What actually happens, and why it's built this way:
+
+- **The split is static, decided once up front** — pending tasks are
+  divided round-robin across N groups, each written into its own
+  self-contained `STRATEGY.md` copy. This is deliberate, not a
+  simplification: `Loop.run()` holds its `Strategy` in memory for an
+  entire run with no locking around it, so N processes reading/writing
+  *one* live plan concurrently would race on both the file and the
+  in-memory state. Giving each branch its own copy sidesteps that
+  entirely — every existing `Loop`/`Strategy`/`Task` code path runs
+  completely unchanged inside each one, unaware anything else is running
+  in parallel.
+- **Each branch gets its own `git worktree`** (`git_utils.worktree_add`)
+  — a separate working directory sharing the same object store as the
+  original repo, so N Coder agents can edit/commit files concurrently
+  without clobbering each other's uncommitted state the way sharing one
+  working tree would.
+- **Each group launches as an ordinary detached session** — same
+  machinery as `--detach` above (`maestro sessions list/attach/stop`
+  all work on them individually; `sessions list` shows each one's
+  `branch`).
+- **Each session pushes its own branch automatically once it finishes**
+  (`--push-on-done`, threaded through automatically by `--fanout` — the
+  *session itself* pushes when it's done, not the parent process trying
+  to push a branch a still-running background process is mid-commit on).
+  Use `maestro sessions push <id>` by hand for one that was stopped early.
+
+**What Maestro deliberately does not do:** decide which tasks are safe
+to run in parallel (`Task` has no dependency graph — that judgment is
+yours before you fan out; don't split tasks that touch the same files),
+or merge the branches back together afterward. You get N pushed
+branches; reconciling/merging/opening PRs from there is a normal git
+workflow, done by you.
 
 ## Watchdog: auto-resuming a rate-limited run
 
@@ -554,7 +697,10 @@ well-isolated, pattern-following project it's good at extending.
 
 No changes to `loop.py`'s control flow, `main.py`, or the UI are required
 for a new *kind* of check (e.g. a Security review pass after Reviewer, or
-a Docs agent). Steps:
+a Docs agent). Steps (`agents/skillwriter.py` + `agents/prompts/skillwriter.md`
+— see [Auto-generated project skill](#auto-generated-project-skill) above
+— is a real, already-in-the-codebase example of exactly this pattern, for
+a one-shot end-of-mission pass rather than a per-task one):
 
 1. **Write its system prompt**: `agents/prompts/security.md`, following
    the pattern in `planner.md`/`coder.md`/`reviewer.md` — describe the
@@ -679,6 +825,13 @@ failure or a surprising verdict after the fact.
   cap (`is_spend_limited()`) — that's recorded as "unknown" and retried
   periodically rather than given a fabricated date. See
   [Watchdog](#watchdog-auto-resuming-a-rate-limited-run) above.
+- **Auth-error *detection* is the same best-effort text matching**, not a
+  structured error code — `is_auth_error()` in `maestro/claude_client.py`
+  matches phrases like "not logged in"/"please log in"/"/login"/"invalid
+  api key" (deliberately checked against a *different* pattern list than
+  `is_rate_limited()`, confirmed not to cross-match either way). If a
+  future CLI version phrases a login failure differently, that's the one
+  place to update.
 - **Task IDs** are `task-<n>` in plan order; re-planning matches tasks by
   title to preserve `done`/`attempts` state for anything that already
   ran.
@@ -687,14 +840,20 @@ failure or a surprising verdict after the fact.
 
 ```
 maestro/
-  main.py            entrypoint: mission intake, verification, kicks off the loop
-  loop.py             plan -> code -> review loop controller, retry/gating logic
-  claude_client.py     subprocess wrapper around `claude -p`, JSON + stream-json parsing
+  main.py            entrypoint: mission intake, verification, kicks off the loop;
+                      also `update`, `sessions`, `watch` subcommand handling
+  loop.py             plan -> code -> review loop controller, retry/gating logic,
+                       end-of-run Skill Writer hook
+  claude_client.py     subprocess wrapper around `claude -p`, JSON + stream-json
+                        parsing, rate-limit/auth-error text classification
   strategy.py           STRATEGY.md <-> structured state, round-trip parse/render
-  git_utils.py           commit checkpoints, diff summaries, clean-tree checks
+  git_utils.py           commits, diffs, clean-tree checks, branches/worktrees/
+                          push/fetch/pull (fanout + `maestro update` build on these)
   scheduler.py            watchdog: watchlist, one-shot check, systemd --user timer install
-  sessions.py              --detach session registry: register/list/attach/stop
-  ui/console.py           rich-based terminal UI, incl. the startup banner
+  sessions.py              --detach session registry: register/list/attach/stop/
+                            remove/clean/push, branch + push_on_done tracking
+  ui/console.py           rich-based terminal UI, incl. the startup banner and the
+                          live view `sessions attach` reconstructs
 agents/
   base.py             Agent base class: loads its prompt file, runs it, logs the call
   planner.py           produces the task plan, assigns each task an agent
@@ -702,6 +861,7 @@ agents/
   researcher.py          investigates a task read-only, reports findings
   tester.py              writes/extends/runs tests for one task, commits
   reviewer.py            APPROVE / REJECT / NEEDS_HUMAN against acceptance criteria
+  skillwriter.py           one-shot, end-of-mission: writes .claude/skills/<slug>/SKILL.md
   prompts/*.md          system prompts, one file per agent, plus the intake
                          passes (mission_clarifier.md, mission_enhancer.md)
 config.py             model, retry limits, tool scopes, per-agent turn budgets

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -23,11 +24,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from rich import box
+from rich.table import Table
 from rich.text import Text
 
 from config import DEFAULT_CONFIG
 from maestro import git_utils, scheduler, sessions
-from maestro.claude_client import ClaudeCLINotFound
+from maestro.claude_client import ClaudeCLINotFound, is_auth_error
 from maestro.loop import Loop
 from maestro.strategy import Strategy
 from maestro.ui.console import MaestroUI
@@ -123,6 +126,11 @@ progress lives in STRATEGY.md (and, unless the mission was NO-COMMIT, in git his
         "overnight run.",
     )
     run_p.add_argument(
+        "--no-skill", action="store_true",
+        help="Don't auto-generate a .claude/skills/<slug>/SKILL.md for the finished "
+        "project once the mission is done.",
+    )
+    run_p.add_argument(
         "--deep-review", action="store_true",
         help="After the Reviewer approves a task, also run Claude Code's own "
         "/code-review skill against the change as a supplementary, informational "
@@ -133,6 +141,20 @@ progress lives in STRATEGY.md (and, unless the mission was NO-COMMIT, in git his
         "--retry-blocked", action="store_true",
         help="With --resume: reset any needs_human tasks back to pending (attempts=0) "
         "before continuing, so they get another shot after you've fixed whatever blocked them.",
+    )
+    run_p.add_argument(
+        "--fanout", type=int, default=None, metavar="N",
+        help="Split this already-planned project's pending tasks evenly across N git "
+        "worktrees/branches and launch N detached sessions, one per branch, instead of "
+        "running the plan in this directory. Requires an existing STRATEGY.md (run the "
+        "Planner first, e.g. with --dry-run) and a clean git repo. Maestro does not know "
+        "which tasks are safe to run in parallel -- that's on you to judge before fanning out.",
+    )
+    run_p.add_argument(
+        "--push-on-done", action="store_true",
+        help="Push the current git branch to its remote once the mission finishes "
+        "successfully. Set automatically on each session started by --fanout; also usable "
+        "standalone on an ordinary run.",
     )
 
     watch_p = subparsers.add_parser(
@@ -188,6 +210,7 @@ Examples:
   maestro sessions stop <id>        Gracefully interrupt a session (same as pressing Ctrl-C on it)
   maestro sessions remove <id>      Forget a finished session (registry entry only, log is kept)
   maestro sessions clean            Forget every finished (non-running) session at once
+  maestro sessions push <id>        Push a fanned-out session's branch (see `maestro run --fanout`)
 """,
     )
     sessions_sub = sessions_p.add_subparsers(dest="sessions_command", required=True)
@@ -199,6 +222,17 @@ Examples:
     sessions_remove = sessions_sub.add_parser("remove", help="Forget a finished session's registry entry.")
     sessions_remove.add_argument("id", help="Session id (see `maestro sessions list`).")
     sessions_sub.add_parser("clean", help="Forget every finished (non-running) session's registry entry.")
+    sessions_push = sessions_sub.add_parser(
+        "push", help="Push a fanned-out session's branch to its remote (manual escape hatch)."
+    )
+    sessions_push.add_argument("id", help="Session id (see `maestro sessions list`).")
+
+    subparsers.add_parser(
+        "update",
+        help="Pull the latest main from GitHub into this installed copy of maestro.",
+        description="Self-update: pulls origin/main into the installed maestro source "
+        "(editable installs only) or re-runs `pipx upgrade maestro` otherwise.",
+    )
 
     return p.parse_args(argv)
 
@@ -212,6 +246,7 @@ def build_config(args: argparse.Namespace):
     cfg.commit_every_attempt = args.commit_every_attempt
     cfg.bare = args.bare
     cfg.deep_review = args.deep_review
+    cfg.generate_skill = not args.no_skill
     return cfg
 
 
@@ -315,15 +350,30 @@ def clarify_mission(ui: MaestroUI, client, cfg, mission: str) -> List[ClarifyQue
 def ask_clarifying_questions(ui: MaestroUI, questions: List[ClarifyQuestion]) -> List[tuple]:
     """Interactively ask each question, Enter accepts the suggested
     default. Returns (question, answer) pairs, folded into the mission
-    text before it goes to enhance_mission."""
+    text before it goes to enhance_mission.
+
+    Each question gets its own panel plus an explicit "Got it" echo of
+    what was captured before moving to the next one -- a bare input()
+    loop gives no feedback that an answer actually registered, which is
+    exactly the kind of silence that made the earlier shift-enter-mashing
+    problem this session (see _drain_stdin) hard to notice was happening
+    at all. A summary panel at the end gives one last checkpoint before
+    the answers get folded into the mission text."""
     if not questions:
         return []
     _drain_stdin()  # clarify_mission just blocked on a network call -- see _drain_stdin
-    ui.console.print("\n[bold cyan]A few quick questions before I write this up:[/bold cyan]")
+    ui.console.print("\n[bold cyan]A few quick questions before I write this up:[/bold cyan]\n")
+    total = len(questions)
     answers = []
-    for q in questions:
-        raw = input(f"  {q.question} [{q.default}]: ").strip()
-        answers.append((q.question, raw or q.default))
+    for i, q in enumerate(questions, start=1):
+        ui.print_panel(f"Question {i} of {total}", q.question, style="cyan")
+        raw = input(f"  [{q.default}]: ").strip()
+        answer = raw or q.default
+        answers.append((q.question, answer))
+        ui.console.print(f"  [green]✓ Got it:[/green] {answer}\n")
+
+    summary = "\n".join(f"[bold]{q}[/bold]\n{a}" for q, a in answers)
+    ui.print_panel("Your answers", summary, style="green")
     return answers
 
 
@@ -533,6 +583,67 @@ def preflight(ui: MaestroUI, mission: str, cwd: str, skip_prompts: bool) -> bool
     return True
 
 
+# -- self-update ---------------------------------------------------------
+
+
+def _find_source_repo() -> Optional[Path]:
+    """Distinguishes an editable install (`pip install -e` / `pipx install
+    --editable`) from a non-editable one. An editable install runs this
+    very file straight out of a real git checkout, so a `.git` directory
+    sits a couple of levels above it (package dir -> repo root); a
+    non-editable pipx/pip install runs a *copy* of this file sitting
+    inside a venv's site-packages, with no `.git` ancestor anywhere nearby.
+    `maestro update` uses this to decide whether an in-place `git pull`
+    does anything at all -- see main_update."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here, *list(here.parents)[:6]):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def main_update(ui: MaestroUI) -> int:
+    repo = _find_source_repo()
+    if repo is not None:
+        if not git_utils.is_clean(cwd=str(repo)):
+            ui.print_error(
+                f"{repo} (this install's source checkout) has uncommitted changes -- "
+                f"commit or stash before updating:\n\n{git_utils.short_status(cwd=str(repo))}"
+            )
+            return 1
+        ui.console.print(f"[cyan]Editable install detected at {repo} -- pulling origin/main...[/cyan]")
+        if not git_utils.fetch(cwd=str(repo)):
+            ui.print_error(f"git fetch failed in {repo}.")
+            return 1
+        ok, msg = git_utils.pull_ff_only(cwd=str(repo))
+        if not ok:
+            ui.print_error(f"Update failed (not a fast-forward, or another git error):\n\n{msg}")
+            return 1
+        sha = git_utils.head_sha(cwd=str(repo))[:8]
+        ui.console.print(
+            f"[green]Updated to {sha}.[/green] Editable install -- no reinstall needed, "
+            "changes take effect immediately."
+        )
+        return 0
+
+    if shutil.which("pipx"):
+        proc = subprocess.run(["pipx", "list", "--short"], capture_output=True, text=True)
+        installed = {line.split()[0] for line in proc.stdout.splitlines() if line.strip()}
+        if "maestro" in installed:
+            ui.console.print("[cyan]Non-editable pipx install detected -- running `pipx upgrade maestro`...[/cyan]")
+            result = subprocess.run(["pipx", "upgrade", "maestro"])
+            return result.returncode
+
+    ui.print_error(
+        "Could not detect how maestro is installed (not an editable git checkout, "
+        "not a pipx-managed package). To update manually:\n\n"
+        "  pipx upgrade maestro\n"
+        "  # or\n"
+        "  pip install --upgrade git+https://github.com/Adam-BH/maestro-cli.git"
+    )
+    return 1
+
+
 # -- watchdog management ------------------------------------------------
 
 
@@ -593,7 +704,7 @@ def main_watch(args: argparse.Namespace) -> int:
 # -- session detach/list/attach/stop -------------------------------------
 
 
-def _build_detach_command(cfg, target_dir: str) -> List[str]:
+def _build_detach_command(cfg, target_dir: str, push_on_done: bool = False) -> List[str]:
     """The detached child re-enters exactly the --resume path (main.py's
     existing crash-recovery machinery), just with --yes so it never blocks
     on stdin that no longer has anyone attached to it."""
@@ -608,10 +719,14 @@ def _build_detach_command(cfg, target_dir: str) -> List[str]:
         cmd.append("--no-bare")
     if cfg.deep_review:
         cmd.append("--deep-review")
+    if push_on_done:
+        cmd.append("--push-on-done")
     return cmd
 
 
-def detach_run(ui: MaestroUI, cfg, target_dir: str) -> int:
+def detach_run(
+    ui: MaestroUI, cfg, target_dir: str, branch: Optional[str] = None, push_on_done: bool = False
+) -> str:
     """Spawns `maestro run --resume --yes` for `target_dir` as a background
     process detached from this terminal (its own session via
     start_new_session=True, so it survives the terminal closing) and
@@ -619,12 +734,21 @@ def detach_run(ui: MaestroUI, cfg, target_dir: str) -> int:
     list/attach/stop` can find it afterward. The mission's STRATEGY.md must
     already be saved to disk before this is called -- the child picks up
     from exactly that state via --resume, reusing that machinery instead of
-    any new IPC or process-supervision model."""
+    any new IPC or process-supervision model.
+
+    `branch`/`push_on_done` are set by run_fanout() for a fanned-out
+    session -- `branch` is purely informational (surfaced in `sessions
+    list`; the child works out its own current branch from git directly,
+    it isn't told), `push_on_done` is threaded through to the child's own
+    argv so *it* pushes its own branch once its own run finishes (see
+    main()'s end-of-run handling) rather than this (parent) process trying
+    to push a branch a still-running background process is mid-commit on.
+    Returns the new session id."""
     log_dir = sessions.CONFIG_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     session_id = sessions.new_session_id(target_dir)
     log_path = log_dir / f"{session_id}.log"
-    cmd = _build_detach_command(cfg, target_dir)
+    cmd = _build_detach_command(cfg, target_dir, push_on_done=push_on_done)
 
     with open(log_path, "w", encoding="utf-8") as log_f:
         log_f.write(f"# maestro session {session_id} detached at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
@@ -635,17 +759,105 @@ def detach_run(ui: MaestroUI, cfg, target_dir: str) -> int:
             stdin=subprocess.DEVNULL, start_new_session=True,
         )
 
-    sessions.register(session_id, target_dir, proc.pid, str(log_path))
+    sessions.register(session_id, target_dir, proc.pid, str(log_path), branch=branch, push_on_done=push_on_done)
     ui.print_panel(
         "Detached",
         f"Session:  {session_id}\n"
         f"PID:      {proc.pid}\n"
         f"Project:  {target_dir}\n"
-        f"Log:      {log_path}\n\n"
+        + (f"Branch:   {branch}\n" if branch else "")
+        + f"Log:      {log_path}\n\n"
         f"maestro sessions attach {session_id}   # tail live output (Ctrl-C just detaches)\n"
         f"maestro sessions stop {session_id}     # gracefully interrupt it\n"
         "maestro sessions list                  # see this and any other sessions",
         style="green",
+    )
+    return session_id
+
+
+def run_fanout(ui: MaestroUI, cfg, strategy: Strategy, target_dir: str, n: int) -> int:
+    """Splits an already-planned project's still-open tasks evenly across N
+    git worktrees/branches and launches N detached sessions, one per
+    branch (see git_utils.worktree_add/push and sessions.py's branch/
+    push_on_done fields).
+
+    Deliberately static: the split happens once, up front, rather than N
+    processes claiming tasks from one shared STRATEGY.md at runtime --
+    Loop holds strategy state in memory for an entire run with no locking
+    (see loop.py's run()), so a shared live plan isn't safe today. Giving
+    each branch its own worktree and its own self-contained STRATEGY.md
+    copy sidesteps that entirely: every existing Loop/Strategy code path
+    runs completely unchanged inside each worktree, unaware anything else
+    is happening in parallel.
+
+    Maestro has no task-dependency graph (see strategy.py's Task
+    dataclass), so it cannot know which tasks are safe to split across
+    branches -- that judgment call is on the caller.
+    """
+    if n < 2:
+        ui.print_error("--fanout needs at least 2.")
+        return 1
+    if not strategy.tasks:
+        ui.print_error(
+            "--fanout requires an already-planned project (no tasks in STRATEGY.md yet "
+            "-- run the Planner first, e.g. with --dry-run)."
+        )
+        return 1
+
+    check = git_utils.check_repo(cwd=target_dir)
+    if not check.is_repo:
+        ui.print_error(f"{target_dir} is not a git repo -- --fanout needs git worktrees/branches to isolate each parallel session.")
+        return 1
+    if not check.clean:
+        ui.print_error(f"{target_dir} has uncommitted changes -- commit or stash before fanning out:\n\n{check.status_text}")
+        return 1
+
+    workable = [t for t in strategy.tasks if t.status in ("pending", "rejected", "pending_review")]
+    if len(workable) < n:
+        ui.print_error(f"Only {len(workable)} workable task(s) but --fanout {n} was requested -- reduce N or plan more tasks first.")
+        return 1
+
+    groups = [workable[i::n] for i in range(n)]
+
+    git_utils.fetch(cwd=target_dir)  # branch off an up-to-date main, not a stale local one
+    base_branch = git_utils.current_branch(cwd=target_dir)
+    slug = Path(target_dir).name
+
+    rows = []
+    for i, group in enumerate(groups, start=1):
+        branch = f"maestro/{slug}-{i}"
+        worktree_path = f"{target_dir}-fanout-{i}"
+        ok, msg = git_utils.worktree_add(worktree_path, branch, base=base_branch, cwd=target_dir)
+        if not ok:
+            ui.print_error(f"Failed to create worktree for branch {branch}:\n\n{msg}")
+            return 1
+
+        sub = Strategy(
+            mission=strategy.mission,
+            run_status="in_progress",
+            constraints=strategy.constraints,
+            stack=strategy.stack,
+            no_commit=strategy.no_commit,
+            tasks=group,
+        )
+        sub.add_log("system", f"--fanout: assigned {len(group)} task(s) on branch {branch}.")
+        sub.save(str(Path(worktree_path) / cfg.strategy_path))
+
+        session_id = detach_run(ui, cfg, worktree_path, branch=branch, push_on_done=True)
+        rows.append((branch, worktree_path, session_id, ", ".join(t.id for t in group)))
+
+    table = Table(title=f"Fanned out across {n} branches", show_header=True, header_style="bold cyan", box=box.ROUNDED)
+    table.add_column("Branch")
+    table.add_column("Worktree")
+    table.add_column("Session")
+    table.add_column("Tasks")
+    for branch, worktree_path, session_id, task_ids in rows:
+        table.add_row(branch, worktree_path, session_id, task_ids)
+    ui.console.print(table)
+    ui.console.print(
+        "\n[dim]Each session pushes its branch automatically once it finishes. "
+        "Track them with `maestro sessions list`; merge/PR them yourself once ready -- "
+        "Maestro won't reconcile branches for you.[/dim]"
     )
     return 0
 
@@ -790,6 +1002,19 @@ def main_sessions(args: argparse.Namespace) -> int:
             print(f"Removed {len(finished)} finished session(s): {', '.join(i.id for i in finished)}")
         return 0
 
+    if args.sessions_command == "push":
+        info = sessions.get_session(args.id)
+        if info is None:
+            print(f"No session {args.id!r} registered. See `maestro sessions list`.")
+            return 1
+        branch = info.branch or git_utils.current_branch(cwd=info.project_dir)
+        ok, msg = git_utils.push(branch, cwd=info.project_dir)
+        if ok:
+            print(f"Pushed {branch} to origin.")
+            return 0
+        print(f"Push failed for {branch}:\n\n{msg}")
+        return 1
+
     return 1  # argparse's required=True on the subparser makes this unreachable
 
 
@@ -896,10 +1121,39 @@ def _handle_blocked_end(ui: MaestroUI, loop: Loop) -> str:
             )
 
 
+def ensure_authenticated(ui: MaestroUI, client) -> bool:
+    """One-time proactive check, run right after ClaudeClient() is
+    constructed and before any mission-intake work starts.
+    ClaudeCLINotFound (raised by the constructor itself) only catches a
+    missing `claude` binary -- a present-but-logged-out CLI fails
+    silently instead: clarify_mission/enhance_mission both tolerate any
+    call failure as a nicety-skip, so a login problem would otherwise
+    only surface once real Planner/Coder calls start burning task-retry
+    budget deep into the run. One cheap probe call up front catches it
+    immediately instead."""
+    result = client.probe_auth()
+    if result.ok:
+        return True
+    if not is_auth_error(result.error_message or result.result_text):
+        return True  # some other transient hiccup -- not worth blocking the whole run over
+    ui.print_error(
+        "Claude Code doesn't look logged in:\n\n"
+        f"{result.error_message or result.result_text}\n\n"
+        "Fix it, then re-run maestro:\n\n"
+        "  claude /login   (from inside an interactive `claude` session)\n"
+        "  # or\n"
+        "  claude login    (from the shell)"
+    )
+    return False
+
+
 # -- main --------------------------------------------------------------
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+
+    if args.command == "update":
+        return main_update(MaestroUI())
 
     if args.command == "watch":
         return main_watch(args)
@@ -916,6 +1170,9 @@ def main(argv=None) -> int:
         client = ClaudeClient(model=cfg.model, bare=cfg.bare)
     except ClaudeCLINotFound as exc:
         ui.print_error(str(exc))
+        return 1
+
+    if not ensure_authenticated(ui, client):
         return 1
 
     # cost_usd from `claude -p` is only a real charge under --bare/API-key
@@ -1033,8 +1290,12 @@ def main(argv=None) -> int:
             style="yellow",
         )
 
+    if args.fanout:
+        return run_fanout(ui, cfg, strategy, target_dir, args.fanout)
+
     if args.detach:
-        return detach_run(ui, cfg, target_dir)
+        detach_run(ui, cfg, target_dir)
+        return 0
 
     loop = Loop(cfg, strategy, ui, target_dir, client=client)
     unattended = not args.pause_on_human
@@ -1067,6 +1328,13 @@ def main(argv=None) -> int:
 
     status = loop.strategy.run_status
     if status == "done":
+        if args.push_on_done:
+            branch = git_utils.current_branch(cwd=target_dir)
+            ok, msg = git_utils.push(branch, cwd=target_dir)
+            if ok:
+                ui.console.print(f"[green]Pushed {branch} to origin.[/green]")
+            else:
+                ui.console.print(f"[yellow]Push failed for {branch}:[/yellow] {msg}")
         print_how_to_run(ui, target_dir)
         return 0
     if status == "rate_limited":

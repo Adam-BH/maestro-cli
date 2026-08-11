@@ -125,6 +125,30 @@ def is_spend_limited(text: str) -> bool:
     return any(re.search(p, low) for p in _SPEND_LIMIT_PATTERNS)
 
 
+# Text patterns seen when `claude -p` runs but the CLI isn't authenticated
+# (as opposed to ClaudeCLINotFound, which means the binary itself is
+# missing from PATH). Same best-effort case-insensitive matching approach
+# as _RATE_LIMIT_PATTERNS — the CLI has no structured error code for this
+# either, so this errs toward catching real login-failure messages over
+# being exhaustive.
+_AUTH_ERROR_PATTERNS = (
+    r"not logged in",
+    r"please (run|log ?in)",
+    r"/login",
+    r"invalid api key",
+    r"authentication",
+    r"unauthorized",
+    r"please authenticate",
+)
+
+
+def is_auth_error(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    return any(re.search(p, low) for p in _AUTH_ERROR_PATTERNS)
+
+
 def extract_resume_hint(text: str) -> Optional[str]:
     """Best-effort extraction of "when to retry" from a rate-limit message.
     Returns a human-readable string, or None if nothing could be parsed
@@ -287,6 +311,19 @@ class ClaudeClient:
                 "(https://docs.claude.com/claude-code) or set the correct "
                 "binary name via ClaudeClient(binary=...)."
             )
+
+    def probe_auth(self, timeout: int = 30) -> ClaudeResult:
+        """One trivial, tool-free call used purely to check the CLI is
+        actually authenticated -- ClaudeCLINotFound above only catches a
+        missing binary, not a present-but-logged-out one. Goes through the
+        same self.run() every real agent call uses rather than a bespoke
+        subprocess invocation, so this behaves identically to (and is as
+        cheap as) any other single-turn call. See main.py's
+        ensure_authenticated() for how the result gets classified."""
+        return self.run(
+            prompt="ping", allowed_tools="", max_turns=1,
+            permission_mode="acceptEdits", timeout=timeout,
+        )
 
     def build_command(
         self,

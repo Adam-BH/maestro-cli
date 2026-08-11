@@ -54,13 +54,28 @@ def new_session_id(project_dir: str) -> str:
     return f"{slug}-{uuid.uuid4().hex[:6]}"
 
 
-def register(session_id: str, project_dir: str, pid: int, log_path: str) -> None:
+def register(
+    session_id: str,
+    project_dir: str,
+    pid: int,
+    log_path: str,
+    branch: Optional[str] = None,
+    push_on_done: bool = False,
+) -> None:
+    """`branch`/`push_on_done` are set by `maestro run --fanout` (see
+    main.py's run_fanout/detach_run) so `sessions list` can show which
+    branch a fanned-out session is working on, and so its own end-of-run
+    handling knows whether to push that branch automatically. Both are
+    absent (None/False) for an ordinary `maestro run --detach` session,
+    which isn't tied to any particular branch."""
     data = _load()
     data[session_id] = {
         "project_dir": project_dir,
         "pid": pid,
         "log_path": log_path,
         "started_at": _now_iso(),
+        "branch": branch,
+        "push_on_done": push_on_done,
     }
     _save(data)
 
@@ -94,6 +109,8 @@ class SessionInfo:
     alive: bool
     run_status: str = "unknown"
     progress: Tuple[int, int] = (0, 0)
+    branch: Optional[str] = None
+    push_on_done: bool = False
 
 
 def _to_info(session_id: str, entry: dict) -> SessionInfo:
@@ -116,6 +133,8 @@ def _to_info(session_id: str, entry: dict) -> SessionInfo:
         alive=_pid_alive(entry["pid"]),
         run_status=run_status,
         progress=progress,
+        branch=entry.get("branch"),  # absent on registry entries written before fan-out existed
+        push_on_done=entry.get("push_on_done", False),
     )
 
 

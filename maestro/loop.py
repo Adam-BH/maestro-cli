@@ -28,6 +28,7 @@ plan/retry/checkpoint machinery doesn't change.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 from agents.base import AgentContext
@@ -35,6 +36,7 @@ from agents.coder import Coder, parse_agent_result
 from agents.planner import Planner, parse_plan, parse_stack
 from agents.researcher import Researcher
 from agents.reviewer import Reviewer, parse_verdict
+from agents.skillwriter import SkillWriter
 from agents.tester import Tester
 from config import Config
 from maestro import git_utils
@@ -89,6 +91,7 @@ class Loop:
         self.researcher = Researcher(self.client, config.agents["researcher"], config.prompts_dir, config.log_dir)
         self.tester = Tester(self.client, config.agents["tester"], config.prompts_dir, config.log_dir)
         self.reviewer = Reviewer(self.client, config.agents["reviewer"], config.prompts_dir, config.log_dir)
+        self.skillwriter = SkillWriter(self.client, config.agents["skillwriter"], config.prompts_dir, config.log_dir)
         # Task.agent -> the agent instance that implements it. Reviewer is
         # not in here; it always runs afterward regardless of who produced
         # the work.
@@ -111,6 +114,32 @@ class Loop:
                 f"[checkpoint] STRATEGY.md — iteration {self.strategy.iteration}",
                 cwd=self.cwd,
             )
+
+    # -- skill generation ----------------------------------------------
+
+    def _generate_skill(self) -> None:
+        """Runs once, right after the mission reaches run_status == "done"
+        (see run()) -- packages the finished project into a Claude Code
+        Skill (.claude/skills/<slug>/SKILL.md) for future sessions working
+        in this repo. A nicety on top of an already-successful run: any
+        failure here is logged and swallowed, never turns a "done" run
+        into a failed one."""
+        slug = Path(self.cwd).name
+        context = AgentContext(
+            strategy_text=self.strategy.render(),
+            cwd=self.cwd,
+            extra={"slug": slug},
+            constraints=self.strategy.constraints,
+        )
+        result = self.skillwriter.run(context, on_event=self._event_logger("skillwriter"))
+        if not result.ok:
+            self.strategy.add_log("system", f"Skill generation skipped: {result.error_message or 'agent error'}.")
+            return
+
+        skill_path = f".claude/skills/{slug}/SKILL.md"
+        if not self.strategy.no_commit:
+            git_utils.commit_paths([skill_path], f"Add SKILL.md for {slug}", cwd=self.cwd)
+        self.strategy.add_log("system", f"Generated {skill_path}.")
 
     # -- live activity streaming --------------------------------------
 
@@ -555,6 +584,9 @@ class Loop:
                 task.notes = ""
                 self.strategy.run_status = "in_progress"
                 self.save()
+
+        if self.strategy.run_status == "done" and self.config.generate_skill:
+            self._generate_skill()
 
         self.save()
         return self.strategy.run_status

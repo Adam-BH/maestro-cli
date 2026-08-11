@@ -92,6 +92,37 @@ def head_sha(cwd: Optional[str] = None) -> str:
     return _run(["rev-parse", "HEAD"], cwd=cwd, check=False).stdout.strip()
 
 
+def fetch(cwd: Optional[str] = None, remote: str = "origin") -> bool:
+    proc = _run(["fetch", remote], cwd=cwd, check=False)
+    return proc.returncode == 0
+
+
+def pull_ff_only(cwd: Optional[str] = None, remote: str = "origin", branch: str = "main") -> tuple:
+    """Fast-forward only -- refuses to merge or rebase over local commits,
+    so `maestro update` can never silently rewrite history on top of
+    changes the caller didn't know were there. Returns (ok, message)."""
+    proc = _run(["pull", "--ff-only", remote, branch], cwd=cwd, check=False)
+    text = (proc.stdout + proc.stderr).strip()
+    return proc.returncode == 0, text
+
+
+def worktree_add(worktree_path: str, branch: str, base: str = "main", cwd: Optional[str] = None) -> tuple:
+    """Creates a new branch off `base` and checks it out into a fresh
+    working directory at `worktree_path`, sharing the same object store as
+    `cwd`'s repo -- so a parallel task running there can commit/build
+    independently without a second process touching `cwd`'s own working
+    tree. Returns (ok, message)."""
+    proc = _run(["worktree", "add", "-b", branch, worktree_path, base], cwd=cwd, check=False)
+    text = (proc.stdout + proc.stderr).strip()
+    return proc.returncode == 0, text
+
+
+def push(branch: str, cwd: Optional[str] = None, remote: str = "origin") -> tuple:
+    proc = _run(["push", "-u", remote, branch], cwd=cwd, check=False)
+    text = (proc.stdout + proc.stderr).strip()
+    return proc.returncode == 0, text
+
+
 @dataclass
 class RepoCheck:
     is_repo: bool

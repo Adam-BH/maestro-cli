@@ -53,6 +53,13 @@ class Config:
     # Loop.run_task_cycle). Off by default — extra cost per approved task.
     deep_review: bool = False
 
+    # After a mission finishes, run one extra pass that packages the
+    # finished project into a Claude Code Skill (.claude/skills/<slug>/
+    # SKILL.md) for future sessions working in that repo -- see
+    # agents/skillwriter.py and Loop.run()'s end-of-run hook. On by
+    # default; set False (or pass --no-skill) to skip it.
+    generate_skill: bool = True
+
     # Run each agent with `claude -p --bare` (skips hooks/CLAUDE.md/MCP
     # config for reproducibility). NOTE: --bare only supports
     # ANTHROPIC_API_KEY auth (OAuth/keychain are never read in bare mode) —
@@ -120,6 +127,14 @@ class Config:
             "deep_reviewer": AgentToolConfig(
                 allowed_tools="Read,Glob,Grep,Bash",
                 max_turns=20,
+            ),
+            # Runs once at the very end of a mission (see Loop.run()'s
+            # end-of-run hook) to write .claude/skills/<slug>/SKILL.md.
+            # Write is needed for that one file; no Edit/Bash since it has
+            # no business touching anything else in the project.
+            "skillwriter": AgentToolConfig(
+                allowed_tools="Read,Glob,Grep,Write",
+                max_turns=10,
             ),
         }
     )

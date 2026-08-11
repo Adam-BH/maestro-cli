@@ -10,6 +10,16 @@ You need `git`, the `claude` CLI on your `PATH` and logged in, and Maestro
 installed (`pipx install "git+https://github.com/Adam-BH/maestro-cli.git"`
 — see the README's Installation section for other options).
 
+Don't worry too much about double-checking the "logged in" part by
+hand — the moment you run `maestro run`, it makes one cheap probe call
+to confirm you're actually authenticated (not just that the binary
+exists), and if you're not, it tells you exactly what it detected and
+the fix (`claude /login` or `claude login`) before anything else runs.
+
+Already have it installed? `maestro update` pulls the latest `main` into
+whatever you've got — see [8. Keeping Maestro itself up to
+date](#8-keeping-maestro-itself-up-to-date) below.
+
 ## 1. Your first mission
 
 ```bash
@@ -26,11 +36,13 @@ an empty line.
 Type your mission, then an empty line to finish. What happens next, in order:
 
 1. **Clarifying questions** — if your mission leaves something genuinely
-   open (platform? persistence? auth?), you'll get up to 5 short questions
-   with a suggested default each. Hit Enter to accept a default, or type
-   your own answer. A mission that's already specific enough gets none of
-   this — it's not a fixed checklist, it only asks what this particular
-   mission left ambiguous.
+   open (platform? persistence? auth?), you'll get up to 5 short questions,
+   each in its own panel with a suggested default. Hit Enter to accept the
+   default, or type your own answer — either way you get an explicit
+   "✓ Got it: ..." confirmation before the next question, and a summary
+   panel of everything you answered right before it moves on. A mission
+   that's already specific enough gets none of this — it's not a fixed
+   checklist, it only asks what this particular mission left ambiguous.
 2. **Refine** — your mission (+ any answers) gets turned into a real brief:
    a one-line overview, a bulleted feature list, and key user flows if it's
    complex enough to need them. You'll see this printed back before
@@ -123,10 +135,12 @@ Status and progress come straight from that project's live `STRATEGY.md`
 maestro sessions attach todo-app-24a3cf
 ```
 
-Dumps everything logged so far, then keeps streaming new lines as they
-happen — same colored agent activity you'd see in the foreground. **Ctrl-C
-here only detaches your view.** It does not stop the session; you'll land
-back at your prompt and the mission keeps running in the background. Run
+This isn't a plain log tail — it rebuilds the *same* live header + task
+checklist you'd see if this run were in your foreground terminal right
+now, driven by polling that project's `STRATEGY.md`, with the scrolling
+agent activity feed underneath it exactly as before. **Ctrl-C here only
+detaches your view.** It does not stop the session; you'll land back at
+your prompt and the mission keeps running in the background. Run
 `sessions attach` again any time to look back in.
 
 ### Starting several at once
@@ -162,6 +176,19 @@ saved to `STRATEGY.md`, and the process exits cleanly. It is **not** a
 force-kill; there's deliberately no such command, because interrupting
 mid-write is exactly the kind of thing `STRATEGY.md`-as-source-of-truth
 exists to make safe to do *carefully*, not recklessly.
+
+### Tidying up finished sessions
+
+A session's entry in `sessions list` doesn't disappear on its own once
+it exits — it just sits there marked `[exited]` until you clear it out:
+
+```bash
+maestro sessions remove todo-app-24a3cf   # forget one (its log file is kept)
+maestro sessions clean                    # forget every finished session at once
+```
+
+Both only touch the registry entry, never the log file itself, and
+`remove` refuses on a session that's still running — `stop` it first.
 
 ## 4. Recovering from an interrupt (or a crash)
 
@@ -220,7 +247,43 @@ it any time with `sessions`, and if it ever hits a rate limit while you're
 away, the watchdog brings it back on its own — no terminal, no cron job of
 your own, no babysitting.
 
-## 6. Steering quality and cost
+## 6. Running tasks in parallel across branches
+
+Once a project already has a plan (Planner's already run — `--dry-run`
+gets you there fastest without touching code), you can split its
+remaining tasks across N branches and run them concurrently:
+
+```bash
+maestro run --resume --fanout 3 -C ~/Desktop/todo-app
+```
+
+You'll get a table of the branches, worktrees, and session IDs it just
+created — each one is an ordinary detached session from here on:
+
+```bash
+maestro sessions list      # each fanned-out session shows its own branch
+maestro sessions attach todo-app-8f2a1c   # watch one of them, same as any other session
+```
+
+Each session pushes its own branch to the remote automatically once it
+finishes (`--push-on-done`, set for you by `--fanout`). If you stop one
+early and still want its work pushed:
+
+```bash
+maestro sessions push todo-app-8f2a1c
+```
+
+Two things Maestro deliberately leaves to you:
+
+- **Which tasks are safe to split.** There's no dependency graph between
+  tasks — don't fan out tasks that touch the same files or depend on
+  each other's output. Read the plan first (`--dry-run` or just open
+  `STRATEGY.md`) and judge for yourself.
+- **Merging the branches back.** You get N pushed branches; opening
+  PRs / merging them is a normal git workflow from there — Maestro
+  won't reconcile them for you.
+
+## 7. Steering quality and cost
 
 - `--deep-review` — after the Reviewer approves a task, also run Claude
   Code's own `/code-review` skill against the change, as a second opinion.
@@ -240,8 +303,27 @@ your own, no babysitting.
   me to review" — that's picked up automatically at intake (no flag
   needed) and disables both Maestro's own checkpoint commits and the
   Coder/Tester's commits for the whole run.
+- `--no-skill` — skip the auto-generated `.claude/skills/<slug>/SKILL.md`
+  that otherwise gets written (and committed) once the mission is done.
+  On by default; see section 9 below.
 
-## 7. Reading the receipts
+## 8. Keeping Maestro itself up to date
+
+Separate from anything above — this updates the `maestro` command
+itself, not any project it built:
+
+```bash
+maestro update
+```
+
+Figures out how you installed it and does the right thing: pulls
+`origin/main` in place if you're running an editable/source install
+(refuses if that checkout has uncommitted changes, and never rewrites
+history — fast-forward only), or runs `pipx upgrade maestro` if it's a
+non-editable pipx install. If it can't tell, it prints the manual
+command instead of guessing.
+
+## 9. Reading the receipts
 
 Everything is plain files, on purpose — you're never locked into asking
 Maestro to tell you what happened:
@@ -259,6 +341,11 @@ Maestro to tell you what happened:
 - **`git log`** in the project — every approved task is its own commit
   (unless no-commit mode is active), so the commit history doubles as a
   changelog of what Maestro actually did.
+- **`.claude/skills/<slug>/SKILL.md`** in the project root — written
+  automatically once the mission is done (`--no-skill` to opt out).
+  Install/run/test instructions specific to that app, so the next Claude
+  Code session that opens there — yours, or another `maestro run
+  --resume` — doesn't have to rediscover them from scratch.
 
 ## Cheat sheet
 
@@ -274,8 +361,12 @@ Maestro to tell you what happened:
 | Recover after a crash/interrupt | `maestro run --resume -C <dir>` |
 | Give parked tasks another shot | `maestro run --resume --retry-blocked --yes` |
 | Auto-resume after a rate limit | `maestro watch add <dir>` + `maestro watch install` |
+| Split a planned project across branches | `maestro run --resume --fanout N` |
+| Push a fanned-out session's branch by hand | `maestro sessions push <id>` |
+| Forget finished sessions | `maestro sessions remove <id>` / `maestro sessions clean` |
 | Second opinion via /code-review | `maestro run --deep-review` |
 | Always stop for human decisions | `maestro run --pause-on-human` |
+| Update Maestro itself | `maestro update` |
 
 ## Gotchas
 
@@ -291,3 +382,13 @@ Maestro to tell you what happened:
   with `--detach`. A plain foreground `maestro run` — even a long one — is
   invisible to `sessions` (there's nothing to attach to; you're already
   attached).
+- A session's registry entry doesn't clean itself up when it exits — it
+  sits there `[exited]` until you `sessions remove`/`clean` it. The log
+  file itself is never deleted by either command.
+- `--fanout` needs an already-planned, clean git repo with at least N
+  workable tasks — it refuses outright rather than fanning out a partial
+  or dirty project. It also won't merge the branches it creates back
+  together; that part's on you.
+- `maestro update` refuses on an editable/source install with
+  uncommitted changes, same as any other fast-forward-only git pull —
+  commit or stash first.
