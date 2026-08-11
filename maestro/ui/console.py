@@ -48,6 +48,7 @@ attention and a scrollback trail.
 from __future__ import annotations
 
 import signal
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -119,7 +120,18 @@ class MaestroUI:
     """Owns all terminal output for a run."""
 
     def __init__(self, console: Optional[Console] = None, history_limit: int = 500, show_cost: bool = True):
-        self.console = console or Console()
+        # force_terminal=True: a detached `maestro run --detach` writes its
+        # stdout to a log file (see main.py's detach_run), and Rich's
+        # default auto-detection drops all ANSI color codes for a
+        # non-terminal destination -- meaning the log would be plain text
+        # forever, colors gone even when `maestro sessions attach` replays
+        # it to a real terminal afterward. Forcing it on keeps the color
+        # bytes in the log so attach gets them back. This does NOT force
+        # the interactive Live redraw region -- see self._interactive below,
+        # which gates that separately based on the *real* terminal-ness of
+        # the underlying stream, checked before anything here overrides it.
+        self.console = console or Console(force_terminal=True)
+        self._interactive = self.console.file.isatty() if hasattr(self.console.file, "isatty") else False
         self.history: list = []
         self.history_limit = history_limit
         self.show_cost = show_cost
@@ -142,12 +154,13 @@ class MaestroUI:
 
     @contextmanager
     def live(self):
-        if not self.console.is_terminal:
+        if not self._interactive:
             # Not a real terminal (piped, redirected to a file, CI logs) —
             # Live can't do incremental redraws here and ends up batching
             # everything into one dump at process exit instead. Skip it;
             # log()/set_agent()/clear_agent() already fall back to plain
-            # sequential console.print() when self._live is None.
+            # sequential console.print() when self._live is None -- still
+            # colored (see force_terminal above), just not redrawn in place.
             self._live = None
             yield self
             return

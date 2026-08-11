@@ -40,8 +40,17 @@ def parse_stack(text: str) -> str:
     into STRATEGY.md's `## Stack` section. Returns "" if the Planner
     didn't emit one (e.g. a revision that's deliberately keeping the
     existing decision — see loop.py's plan_step, which only overwrites
-    Strategy.stack when this is non-empty)."""
+    Strategy.stack when this is non-empty).
+
+    Tolerates a missing END_STACK marker (seen in practice — the model
+    sometimes runs straight into PLAN: without it) by falling back to
+    "stop at the next PLAN:", which the required output format guarantees
+    always follows. Preferring the explicit END_STACK when present keeps
+    this exact/strict for the common case; the fallback only kicks in when
+    that first match fails."""
     m = re.search(r"STACK:\s*\n(.*?)\nEND_STACK", text, re.S)
+    if not m:
+        m = re.search(r"STACK:\s*\n(.*?)\nPLAN:", text, re.S)
     return m.group(1).strip() if m else ""
 
 

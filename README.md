@@ -18,6 +18,10 @@ reads and every loop step updates. You describe what you want built once,
 walk away, and come back to either a finished project or a clear,
 task-by-task account of exactly where it got stuck and why.
 
+New here? [TUTORIAL.md](TUTORIAL.md) is a hands-on walkthrough (first
+mission, detaching/checking on sessions, the watchdog); this README is the
+reference.
+
 ## What this actually is
 
 Maestro is not itself an AI — it has no model, no API key, no

@@ -640,20 +640,25 @@ def main_sessions(args: argparse.Namespace) -> int:
 
         print(f"Attached to {args.id} (pid {info.pid}) -- Ctrl-C detaches without stopping it.\n")
         with log_path.open("r", encoding="utf-8", errors="replace") as f:
-            print(f.read(), end="")
+            # flush=True throughout: stdout is fully buffered (not
+            # line-buffered) whenever it isn't a real terminal -- piped,
+            # redirected, or captured by a wrapper -- so without this,
+            # nothing would actually show up until the buffer filled or the
+            # process exited, defeating the point of a *live* tail.
+            print(f.read(), end="", flush=True)
             try:
                 while True:
                     line = f.readline()
                     if line:
-                        print(line, end="")
+                        print(line, end="", flush=True)
                         continue
                     current = sessions.get_session(args.id)
                     if current is None or not current.alive:
-                        print(f"\n[session {args.id} has exited]")
+                        print(f"\n[session {args.id} has exited]", flush=True)
                         return 0
                     time.sleep(0.5)
             except KeyboardInterrupt:
-                print(f"\nDetached. Session {args.id} keeps running in the background.")
+                print(f"\nDetached. Session {args.id} keeps running in the background.", flush=True)
                 return 0
 
     if args.sessions_command == "stop":
