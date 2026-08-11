@@ -42,7 +42,9 @@ from maestro.claude_client import (
     ClaudeClient,
     ClaudeResult,
     extract_resume_hint,
+    get_usage_resets,
     is_rate_limited,
+    is_spend_limited,
     summarize_stream_event,
 )
 from maestro.strategy import Strategy, Task
@@ -134,8 +136,25 @@ class Loop:
         combined = " ".join(filter(None, [result.error_message, result.result_text, result.raw_stderr]))
         return combined if is_rate_limited(combined) else None
 
+    def _resume_hint(self, detail: str) -> str:
+        # A spend/credit cap ("monthly spend limit") isn't the session/week
+        # usage limiter — /usage has no reset time for it at all, so don't
+        # even ask; go straight to the text-based hint (which, for this
+        # message, is also unknown — see extract_resume_hint()).
+        if not is_spend_limited(detail):
+            live = get_usage_resets(self.client.binary)
+            future = [dt for dt in live.values() if dt]
+            if future:
+                soonest = min(future)
+                return soonest.strftime("%Y-%m-%d %H:%M UTC") + " (from `claude -p /usage`)"
+        return (
+            extract_resume_hint(detail)
+            or "unknown — the watchdog will keep checking periodically; "
+               "see claude.ai/settings/usage for a credit/spend cap"
+        )
+
     def _pause_for_rate_limit(self, agent_name: str, detail: str) -> None:
-        hint = extract_resume_hint(detail) or "unknown — try --resume again later"
+        hint = self._resume_hint(detail)
         self.strategy.resume_after = hint
         self.strategy.run_status = "rate_limited"
         self.strategy.add_log(

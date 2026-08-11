@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 
@@ -93,12 +93,36 @@ _RATE_LIMIT_PATTERNS = (
     r"overloaded",
 )
 
+# Subset of the above that are a billing/credit cap ("You've hit your
+# monthly spend limit ..."), not the session/weekly usage limiter. `claude
+# -p "/usage"` (see get_usage_resets()) only reports session/week reset
+# times — it has no reset time for a spend cap at all (raising/waiting it
+# out both happen at claude.ai/settings/usage) — so these must not be
+# treated as answerable by that lookup, and must not get a fabricated
+# reset date either (see extract_resume_hint()).
+_SPEND_LIMIT_PATTERNS = (
+    r"spend limit",
+    r"monthly limit",
+    r"quota",
+)
+
 
 def is_rate_limited(text: str) -> bool:
     if not text:
         return False
     low = text.lower()
     return any(re.search(p, low) for p in _RATE_LIMIT_PATTERNS)
+
+
+def is_spend_limited(text: str) -> bool:
+    """True for a billing/credit cap rather than the session/weekly usage
+    limiter — see _SPEND_LIMIT_PATTERNS. Callers use this to decide whether
+    a live `claude -p "/usage"` lookup (get_usage_resets()) is even
+    relevant: it only ever reports session/week reset times."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(re.search(p, low) for p in _SPEND_LIMIT_PATTERNS)
 
 
 def extract_resume_hint(text: str) -> Optional[str]:
@@ -126,17 +150,15 @@ def extract_resume_hint(text: str) -> Optional[str]:
         if m:
             return m.group(0).strip()
 
-    # Monthly spend-limit messages carry no machine-readable reset time at
-    # all — the CLI just says "monthly spend limit". Billing cycles reset
-    # on the 1st, so the 1st of next month UTC is a reasonable estimate: a
-    # scheduler polling this can wait until then instead of hammering the
-    # CLI every few minutes on an unknown hint.
-    if re.search(r"monthly", text, re.I):
-        now = datetime.now(timezone.utc)
-        year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
-        reset = now.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
-        return reset.strftime("%Y-%m-%d %H:%M UTC") + " (estimated monthly reset, not exact)"
-
+    # Spend/credit-cap messages (is_spend_limited()) carry no machine-
+    # readable reset time at all — the CLI just says "monthly spend
+    # limit" and points at claude.ai/settings/usage. There used to be a
+    # guess here ("assume the 1st of next calendar month"), but billing
+    # cycles don't actually reset on the calendar month boundary, so that
+    # guess was routinely weeks off and — worse — looked precise enough to
+    # trust, causing a scheduler to sit idle way past the real reset.
+    # Better to admit it's unknown and let the caller poll periodically
+    # (see UNKNOWN_HINT_RETRY_INTERVAL in scheduler.py).
     return None
 
 
@@ -159,6 +181,74 @@ def parse_resume_hint(hint: Optional[str]) -> Optional[datetime]:
         return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+# `claude -p "/usage"` runs the same /usage slash command available in an
+# interactive session and returns its answer as plain text in the JSON
+# result, e.g.:
+#   Current session: 3% used · resets Aug 11, 1:30pm (Africa/Tunis)
+#   Current week (all models): 23% used · resets Aug 13, 3am (Africa/Tunis)
+# This is ground truth from the account, not a guess — far better than
+# regex-scraping a timestamp out of an error message that often doesn't
+# carry one. It does NOT cover the separate monthly spend/credit cap (see
+# is_spend_limited()); that has no queryable reset time at all.
+_USAGE_RESET_RE = re.compile(
+    r"(Current session|Current week)[^\n]*?resets\s+"
+    r"([A-Za-z]{3,9}\s+\d{1,2}),\s*(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)",
+    re.I,
+)
+
+
+def _parse_usage_clock(datepart: str, timepart: str, tzname: str, now: datetime) -> Optional[datetime]:
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(tzname)
+    except Exception:
+        return None
+    timepart_norm = timepart.strip().upper().replace(" ", "")
+    fmt = "%b %d %I:%M%p" if ":" in timepart_norm else "%b %d %I%p"
+    try:
+        naive = datetime.strptime(f"{datepart.strip()} {timepart_norm}", fmt)
+    except ValueError:
+        return None
+    local_now = now.astimezone(tz)
+    candidate = naive.replace(year=local_now.year, tzinfo=tz)
+    # Reset times are always near-term (session: hours, week: days). If the
+    # parsed date lands more than a few days in the past, it must mean a
+    # year boundary was crossed (e.g. checked Dec 31, reset is Jan 2).
+    if candidate < local_now - timedelta(days=3):
+        candidate = candidate.replace(year=local_now.year + 1)
+    return candidate.astimezone(timezone.utc)
+
+
+def get_usage_resets(binary: str = "claude", timeout: int = 45) -> dict:
+    """Live-queries `claude -p "/usage"` and returns whatever of
+    {"session": datetime, "week": datetime} it could parse out (UTC,
+    timezone-aware) — the real reset times for the session/weekly usage
+    limiter. Returns {} on any failure (CLI missing, timeout, unparseable
+    output, itself rate-limited) so callers can fall back to a text-based
+    hint instead of raising."""
+    try:
+        proc = subprocess.run(
+            [binary, "-p", "/usage", "--output-format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        data = json.loads(proc.stdout)
+        text = data.get("result") or ""
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+    now = datetime.now(timezone.utc)
+    out: dict = {}
+    for label, datepart, timepart, tzname in _USAGE_RESET_RE.findall(text):
+        dt = _parse_usage_clock(datepart, timepart, tzname, now)
+        if dt is not None:
+            key = "session" if label.lower().startswith("current session") else "week"
+            out[key] = dt
+    return out
 
 
 @dataclass
