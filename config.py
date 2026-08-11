@@ -26,6 +26,13 @@ class AgentToolConfig:
     allowed_tools: str
     max_turns: int
     permission_mode: str = "acceptEdits"
+    # Hard ceiling on one `claude -p` call, in seconds. Without this, a
+    # stalled subprocess (network hiccup, a `claude` binary getting
+    # replaced mid-call, a permission prompt that never resolves) blocks
+    # `maestro run` forever with no way out but Ctrl-C -- generous enough
+    # to cover a real multi-turn tool-use session, not so long that a
+    # genuine hang looks like progress for half an hour.
+    timeout: int = 1800
 
 
 @dataclass
@@ -86,6 +93,13 @@ class Config:
     # Turn budget for the one-shot clarifying-questions pass at intake (no
     # tools, pure text — kept tiny since it's just generating 0-5 questions).
     mission_clarifier_max_turns: int = 4
+
+    # Timeout (seconds) for the one-shot mission clarify/enhance passes at
+    # intake -- single-turn, no tools, so genuinely slow completion isn't
+    # expected; kept short so a stalled `claude` subprocess here (see
+    # AgentToolConfig.timeout) fails fast instead of hanging the very first
+    # step of a run with no feedback beyond a spinner.
+    mission_intake_timeout: int = 90
 
     agents: dict = field(
         default_factory=lambda: {

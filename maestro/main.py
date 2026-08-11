@@ -327,6 +327,7 @@ def clarify_mission(ui: MaestroUI, client, cfg, mission: str) -> List[ClarifyQue
             max_turns=cfg.mission_clarifier_max_turns,
             permission_mode="acceptEdits",
             system_prompt=system_prompt,
+            timeout=cfg.mission_intake_timeout,
         )
     if not result.ok:
         return []
@@ -410,6 +411,7 @@ def enhance_mission(ui: MaestroUI, client, cfg, mission: str) -> MissionIntake:
             max_turns=cfg.mission_enhancer_max_turns,
             permission_mode="acceptEdits",
             system_prompt=system_prompt,
+            timeout=cfg.mission_intake_timeout,
         )
     if not result.ok:
         ui.console.print(

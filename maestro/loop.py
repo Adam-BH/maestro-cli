@@ -342,6 +342,7 @@ class Loop:
             max_turns=tool_config.max_turns,
             permission_mode=tool_config.permission_mode,
             cwd=self.cwd,
+            timeout=tool_config.timeout,
             on_event=self._event_logger("deep_reviewer"),
         )
         self.ui.record_call(result.cost_usd, result.num_turns)

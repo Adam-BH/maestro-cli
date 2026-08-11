@@ -73,6 +73,7 @@ class Agent:
             permission_mode=self.tool_config.permission_mode,
             system_prompt=self._system_prompt,
             cwd=context.cwd,
+            timeout=self.tool_config.timeout,
             on_event=on_event,
         )
         self._log_call(prompt, result)
