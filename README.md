@@ -154,8 +154,10 @@ pipx uninstall maestro
 maestro run              # interactive: describe your mission, in the current directory
 ```
 
-`run` is the only subcommand today; more may show up later (e.g. a
-dedicated `resume`) without breaking `maestro run`.
+`run` is the main subcommand. There's also `watch`, which manages the
+watchdog that auto-resumes a run paused on a usage/rate limit — see
+[Watchdog: auto-resuming a rate-limited run](#watchdog-auto-resuming-a-rate-limited-run)
+below.
 
 Useful flags (all go after `run`, e.g. `maestro run --resume --yes`):
 
@@ -293,6 +295,107 @@ something wrong, and `--resume`.
 
 A global `max_total_iterations` cap exists purely as a backstop against a
 pathological plan — it should never realistically be hit.
+
+## Watchdog: auto-resuming a rate-limited run
+
+When a run pauses on a usage/rate limit (step 4 above), nothing brings it
+back on its own by default — you'd have to remember to come back and run
+`maestro run --resume` yourself once the limit clears. `maestro watch`
+automates exactly that, and only that. It's a **one-shot script + system
+timer** (`maestro/scheduler.py`), not a background daemon and not another
+agent watching your terminal: `maestro watch check` looks at every
+registered project once, does nothing unless one of them is due, and
+exits. A system timer just calls that one-shot on a schedule.
+
+### How it knows when to retry
+
+- **Session/weekly usage limits** — the ordinary "you've hit your usage
+  limit" pause — get an exact reset time. On pause, Maestro shells out to
+  `claude -p "/usage"` (`get_usage_resets()` in `maestro/claude_client.py`)
+  — the same read-only check available as `/usage` in an interactive
+  session — and parses its real answer (e.g. "Current session: resets Aug
+  11, 1:30pm (Africa/Tunis)" / "Current week: resets Aug 13, 3am
+  (Africa/Tunis)") into an exact UTC timestamp. That's ground truth from
+  your account, not a guess.
+- **Monthly spend/credit caps** — a separate, billing-level limit ("You've
+  hit your monthly spend limit") — have no queryable reset time at all
+  (`claude`'s own `/usage-credits` command just opens a browser to
+  `claude.ai/settings/usage` so you can manage it by hand; Maestro never
+  calls that command itself, so the watchdog never pops a browser open on
+  its own). For these, `resume_after` is honestly recorded as "unknown,"
+  and the watchdog just retries every 6 hours
+  (`UNKNOWN_HINT_RETRY_INTERVAL` in `maestro/scheduler.py`) until it
+  clears, instead of committing to a fabricated exact-looking date.
+
+### Commands
+
+```bash
+maestro watch add .                          # register the current project directory
+maestro watch add /path/to/project           # or a specific one
+maestro watch list                           # show every registered project + its status/resume time
+maestro watch check                          # run one check pass right now (what the timer calls)
+maestro watch install                        # install + start a systemd --user timer (every 15m)
+maestro watch install --interval-minutes 5   # custom interval
+maestro watch remove .                       # stop watching a project
+maestro watch uninstall                      # stop and remove the timer entirely
+```
+
+`maestro watch check` walks every registered project's `STRATEGY.md`; for
+each one whose `run_status` is `rate_limited` and whose resume time has
+passed, it runs `maestro run --resume --yes` for you and logs the output
+to `~/.config/maestro/logs/<project>-<timestamp>.log`. Only
+`run_status == rate_limited` is handled — a `blocked` run (tasks parked on
+`needs_human`) needs an actual human decision, not a timer; that's the
+prompt `maestro run` shows you at the end of a blocked interactive run
+instead.
+
+### Installing the timer (Linux)
+
+`maestro watch install` writes and enables a `systemd --user` timer +
+oneshot service (`~/.config/systemd/user/maestro-watchdog.{timer,service}`)
+that calls `maestro watch check` on the interval you gave it. This
+survives terminal closures and reboots for free, since it's just
+systemd — Maestro isn't running any process of its own between checks.
+
+One extra step if you want it to keep firing after you log out entirely
+(not just while a graphical/terminal session is open):
+
+```bash
+loginctl enable-linger $USER
+```
+
+It's a normal systemd unit, so normal systemd commands work on it too:
+
+```bash
+systemctl --user status maestro-watchdog.timer     # is it active?
+systemctl --user list-timers                       # when does it next fire?
+journalctl --user -u maestro-watchdog.service       # past run output
+```
+
+**Not on Linux?** `install`/`uninstall` are systemd-specific — there's no
+macOS/Windows equivalent built in yet. `maestro watch check` itself has no
+such dependency though: wire it into `cron` or `launchd` (macOS) or Task
+Scheduler (Windows) yourself to get the same effect — just run
+`maestro watch check` (or `python -m maestro.main watch check` from a
+source checkout) every N minutes.
+
+### State
+
+- `~/.config/maestro/watchlist.json` — registered project directories.
+- `~/.config/maestro/watchdog-state.json` — per-project last-attempt
+  timestamps, so an unknown resume hint isn't retried on every single
+  tick.
+- `~/.config/maestro/logs/` — one log file per resume attempt the
+  watchdog makes.
+
+### Customizing
+
+| You want to... | Touch this |
+|---|---|
+| Change how often the timer fires | `maestro watch install --interval-minutes N` (re-running install overwrites the existing timer unit) |
+| Change how long to wait before retrying an "unknown" resume hint | `UNKNOWN_HINT_RETRY_INTERVAL` in `maestro/scheduler.py` |
+| Change what counts as a rate limit / spend cap, or how a reset time is extracted | `is_rate_limited()`, `is_spend_limited()`, `extract_resume_hint()`, `get_usage_resets()` in `maestro/claude_client.py` — update these if a future `claude` CLI version phrases limit errors differently |
+| Change what happens on each check (e.g. notify somewhere instead of just resuming) | `check_project()` in `maestro/scheduler.py` |
 
 ## Terminal UI (`maestro/ui/console.py`)
 
@@ -480,12 +583,18 @@ failure or a surprising verdict after the fact.
   external thing blocked it (credentials, an ambiguous decision, etc.)
   before choosing "retry" (`--pause-on-human` mode) or `--retry-blocked`
   (default unattended mode).
-- **Rate-limit detection is best-effort text matching**, not a structured
-  error code from the CLI — `maestro/claude_client.py`'s
-  `is_rate_limited()` / `extract_resume_hint()` match on phrases like
-  "usage limit"/"rate limit"/"quota"/429 and try to pull a reset time out
-  of the message. If a future CLI version phrases limit errors
-  differently, that's the one place to update the patterns.
+- **Rate-limit *detection* is best-effort text matching**, not a
+  structured error code from the CLI — `maestro/claude_client.py`'s
+  `is_rate_limited()` matches on phrases like "usage limit"/"rate
+  limit"/"quota"/429. If a future CLI version phrases limit errors
+  differently, that's the one place to update the patterns. Once
+  detected, the *reset time* is not guessed from that same text where it
+  can be avoided: `get_usage_resets()` live-queries `claude -p "/usage"`
+  for the real session/week reset time, ground truth from the account.
+  The one case with no queryable reset at all is a monthly spend/credit
+  cap (`is_spend_limited()`) — that's recorded as "unknown" and retried
+  periodically rather than given a fabricated date. See
+  [Watchdog](#watchdog-auto-resuming-a-rate-limited-run) above.
 - **Task IDs** are `task-<n>` in plan order; re-planning matches tasks by
   title to preserve `done`/`attempts` state for anything that already
   ran.
@@ -499,6 +608,7 @@ maestro/
   claude_client.py     subprocess wrapper around `claude -p`, JSON + stream-json parsing
   strategy.py           STRATEGY.md <-> structured state, round-trip parse/render
   git_utils.py           commit checkpoints, diff summaries, clean-tree checks
+  scheduler.py            watchdog: watchlist, one-shot check, systemd --user timer install
   ui/console.py           rich-based terminal UI
 agents/
   base.py             Agent base class: loads its prompt file, runs it, logs the call
