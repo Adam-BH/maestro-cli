@@ -619,6 +619,5 @@ agents/
   reviewer.py            APPROVE / REJECT / NEEDS_HUMAN against acceptance criteria
   prompts/*.md          system prompts, one file per agent (including mission_enhancer.md)
 config.py             model, retry limits, tool scopes, per-agent turn budgets
-start.sh              venv bootstrap + launcher — see Quick start
 requirements.txt / pyproject.toml   packaging
 ```
