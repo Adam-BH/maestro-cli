@@ -1132,8 +1132,13 @@ def ensure_authenticated(ui: MaestroUI, client) -> bool:
     call failure as a nicety-skip, so a login problem would otherwise
     only surface once real Planner/Coder calls start burning task-retry
     budget deep into the run. One cheap probe call up front catches it
-    immediately instead."""
-    result = client.probe_auth()
+    immediately instead. This is the very first thing main() does -- before
+    even the banner -- so without a spinner here the live network round
+    trip it makes reads as the CLI hanging for a second or two with no
+    output at all (same silent-network-call issue clarify_mission/
+    enhance_mission already solve with their own console.status())."""
+    with ui.console.status("[cyan]Checking Claude Code login...[/cyan]", spinner="dots"):
+        result = client.probe_auth()
     if result.ok:
         return True
     if not is_auth_error(result.error_message or result.result_text):
