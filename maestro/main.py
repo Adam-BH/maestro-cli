@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from rich.text import Text
+
 from config import DEFAULT_CONFIG
 from maestro import git_utils, scheduler, sessions
 from maestro.claude_client import ClaudeCLINotFound
@@ -184,6 +186,8 @@ Examples:
   maestro sessions list             Show every detached session and its current status
   maestro sessions attach <id>      Tail a session's live output (Ctrl-C just detaches, doesn't stop it)
   maestro sessions stop <id>        Gracefully interrupt a session (same as pressing Ctrl-C on it)
+  maestro sessions remove <id>      Forget a finished session (registry entry only, log is kept)
+  maestro sessions clean            Forget every finished (non-running) session at once
 """,
     )
     sessions_sub = sessions_p.add_subparsers(dest="sessions_command", required=True)
@@ -192,6 +196,9 @@ Examples:
     sessions_attach.add_argument("id", help="Session id (see `maestro sessions list`).")
     sessions_stop = sessions_sub.add_parser("stop", help="Gracefully interrupt a session.")
     sessions_stop.add_argument("id", help="Session id (see `maestro sessions list`).")
+    sessions_remove = sessions_sub.add_parser("remove", help="Forget a finished session's registry entry.")
+    sessions_remove.add_argument("id", help="Session id (see `maestro sessions list`).")
+    sessions_sub.add_parser("clean", help="Forget every finished (non-running) session's registry entry.")
 
     return p.parse_args(argv)
 
@@ -209,6 +216,29 @@ def build_config(args: argparse.Namespace):
 
 
 # -- mission intake --------------------------------------------------
+
+def _drain_stdin() -> None:
+    """Discards whatever's sitting unread in the terminal's input buffer.
+    Called right before an input() prompt that follows a blocking network
+    call (clarify_mission/enhance_mission) — those calls give no visual
+    feedback of their own turnaround time, so a user who thinks the CLI
+    has hung tends to mash Enter (or Shift-Enter, which most terminals
+    turn into a plain newline) while waiting. Without this, every one of
+    those buffered newlines gets silently consumed by the next input()
+    call in sequence, which reads as clarifying questions being skipped
+    entirely rather than actually asked. Best-effort: only works on a real
+    POSIX tty, and it's fine to no-op anywhere else (Windows, piped
+    stdin) since there's nothing queued to drain in those cases anyway."""
+    try:
+        import termios
+    except ImportError:
+        return  # not POSIX (e.g. Windows) -- nothing to drain the same way
+    try:
+        if sys.stdin.isatty():
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (termios.error, ValueError, OSError):
+        pass
+
 
 def prompt_mission(ui: MaestroUI) -> str:
     ui.console.print(
@@ -250,13 +280,19 @@ def clarify_mission(ui: MaestroUI, client, cfg, mission: str) -> List[ClarifyQue
     prompt_path = Path(cfg.prompts_dir) / "mission_clarifier.md"
     system_prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
 
-    result = client.run(
-        prompt=f"Raw mission:\n\n{mission}",
-        allowed_tools="",
-        max_turns=cfg.mission_clarifier_max_turns,
-        permission_mode="acceptEdits",
-        system_prompt=system_prompt,
-    )
+    # This is the very first Claude call of a run, before ui.live() ever
+    # starts (see main()) -- so without an explicit spinner here there's
+    # no animation at all telling the user anything's happening, and a
+    # slow turnaround just looks like a hang. console.status() gives the
+    # same spinner used elsewhere without needing a live region.
+    with ui.console.status("[cyan]Reading your mission for anything worth clarifying...[/cyan]", spinner="dots"):
+        result = client.run(
+            prompt=f"Raw mission:\n\n{mission}",
+            allowed_tools="",
+            max_turns=cfg.mission_clarifier_max_turns,
+            permission_mode="acceptEdits",
+            system_prompt=system_prompt,
+        )
     if not result.ok:
         return []
 
@@ -282,6 +318,7 @@ def ask_clarifying_questions(ui: MaestroUI, questions: List[ClarifyQuestion]) ->
     text before it goes to enhance_mission."""
     if not questions:
         return []
+    _drain_stdin()  # clarify_mission just blocked on a network call -- see _drain_stdin
     ui.console.print("\n[bold cyan]A few quick questions before I write this up:[/bold cyan]")
     answers = []
     for q in questions:
@@ -316,14 +353,14 @@ def enhance_mission(ui: MaestroUI, client, cfg, mission: str) -> MissionIntake:
     prompt_path = Path(cfg.prompts_dir) / "mission_enhancer.md"
     system_prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
 
-    ui.console.print("[dim]Enhancing your prompt via Claude...[/dim]")
-    result = client.run(
-        prompt=f"Raw mission:\n\n{mission}",
-        allowed_tools="",
-        max_turns=cfg.mission_enhancer_max_turns,
-        permission_mode="acceptEdits",
-        system_prompt=system_prompt,
-    )
+    with ui.console.status("[cyan]Enhancing your prompt via Claude...[/cyan]", spinner="dots"):
+        result = client.run(
+            prompt=f"Raw mission:\n\n{mission}",
+            allowed_tools="",
+            max_turns=cfg.mission_enhancer_max_turns,
+            permission_mode="acceptEdits",
+            system_prompt=system_prompt,
+        )
     if not result.ok:
         ui.console.print(
             f"[yellow]Prompt enhancing skipped ({result.error_message or 'agent error'}); "
@@ -613,6 +650,93 @@ def detach_run(ui: MaestroUI, cfg, target_dir: str) -> int:
     return 0
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_LOG_AGENT_RE = re.compile(r"^\s*(\S+)\s+│")  # matches log()'s "{agent:>9} │ " prefix
+
+
+def attach_session(session_id: str, info, log_path: Path) -> int:
+    """Rebuilds the same header + live task-checklist a foreground `maestro
+    run` shows (see ui/console.py's MaestroUI.live/_render), rather than a
+    bare tail of the log file.
+
+    A detached run's own stdout is a plain file, not a tty (see
+    detach_run's stdout=log_f) -- MaestroUI checks isatty() and never
+    builds a Live region for it, so the log only ever contains flat log()
+    lines. Tailing that file with a plain print(), as this used to do,
+    faithfully reproduced only that flat stream and nothing else, which is
+    why attach looked like a stripped-down version of the real shell: no
+    header panel, no live task checklist, just scrolling text.
+
+    This attaches its own MaestroUI to *this* terminal (which is a real
+    tty), so it gets the genuine Live region back, and drives its two
+    inputs independently: the task checklist from polling STRATEGY.md in
+    the target project (the loop's actual source of truth -- see
+    sessions.py's module docstring) and the activity feed from tailing the
+    log file, same as before. Each tailed line already carries real ANSI
+    color codes (detach_run's Console forces force_terminal=True for
+    exactly this reason) -- Text.from_ansi decodes those back into a Rich
+    Text with correct cell-width accounting, and printing through
+    ui.live_console() (not a bare print()) is what keeps that interleaving
+    with the Live redraw from corrupting it.
+    """
+    ui = MaestroUI()
+    strategy_path = Path(info.project_dir) / "STRATEGY.md"
+
+    def reload_strategy() -> None:
+        if strategy_path.exists():
+            try:
+                ui.attach_strategy(Strategy.load(str(strategy_path)))
+            except (OSError, ValueError):
+                pass
+
+    reload_strategy()
+    ui.console.print(
+        f"Attached to {session_id} (pid {info.pid}) -- Ctrl-C detaches without stopping it.\n",
+        markup=False,
+    )
+
+    last_agent = None
+
+    with ui.live():
+        target = ui.live_console()
+
+        def emit(raw_line: str) -> None:
+            nonlocal last_agent
+            m = _LOG_AGENT_RE.match(_ANSI_RE.sub("", raw_line))
+            if m:
+                agent = m.group(1).strip().lower()
+                if agent != last_agent:
+                    ui.set_agent(agent, "running")
+                    last_agent = agent
+            target.print(Text.from_ansi(raw_line), end="")
+
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                emit(line)
+            last_reload = time.monotonic()
+            try:
+                while True:
+                    line = f.readline()
+                    if line:
+                        emit(line)
+                        continue
+                    now = time.monotonic()
+                    if now - last_reload > 1.0:
+                        reload_strategy()
+                        ui.refresh()
+                        last_reload = now
+                    current = sessions.get_session(session_id)
+                    if current is None or not current.alive:
+                        target.print(f"\n[session {session_id} has exited]", markup=False)
+                        return 0
+                    time.sleep(0.3)
+            except KeyboardInterrupt:
+                target.print(
+                    f"\nDetached. Session {session_id} keeps running in the background.", markup=False
+                )
+                return 0
+
+
 def main_sessions(args: argparse.Namespace) -> int:
     if args.sessions_command == "list":
         infos = sessions.list_sessions()
@@ -637,32 +761,33 @@ def main_sessions(args: argparse.Namespace) -> int:
         if not log_path.exists():
             print(f"No log file yet at {log_path} -- the session may still be starting.")
             return 1
-
-        print(f"Attached to {args.id} (pid {info.pid}) -- Ctrl-C detaches without stopping it.\n")
-        with log_path.open("r", encoding="utf-8", errors="replace") as f:
-            # flush=True throughout: stdout is fully buffered (not
-            # line-buffered) whenever it isn't a real terminal -- piped,
-            # redirected, or captured by a wrapper -- so without this,
-            # nothing would actually show up until the buffer filled or the
-            # process exited, defeating the point of a *live* tail.
-            print(f.read(), end="", flush=True)
-            try:
-                while True:
-                    line = f.readline()
-                    if line:
-                        print(line, end="", flush=True)
-                        continue
-                    current = sessions.get_session(args.id)
-                    if current is None or not current.alive:
-                        print(f"\n[session {args.id} has exited]", flush=True)
-                        return 0
-                    time.sleep(0.5)
-            except KeyboardInterrupt:
-                print(f"\nDetached. Session {args.id} keeps running in the background.", flush=True)
-                return 0
+        return attach_session(args.id, info, log_path)
 
     if args.sessions_command == "stop":
         print(sessions.stop_session(args.id))
+        return 0
+
+    if args.sessions_command == "remove":
+        info = sessions.get_session(args.id)
+        if info is None:
+            print(f"No session {args.id!r} registered. See `maestro sessions list`.")
+            return 1
+        if info.alive:
+            print(f"Session {args.id} (pid {info.pid}) is still running -- `maestro sessions stop {args.id}` it first.")
+            return 1
+        sessions.remove(args.id)
+        print(f"Removed {args.id} from the session registry (log kept at {info.log_path}).")
+        return 0
+
+    if args.sessions_command == "clean":
+        infos = sessions.list_sessions()
+        finished = [i for i in infos if not i.alive]
+        for info in finished:
+            sessions.remove(info.id)
+        if not finished:
+            print("Nothing to clean -- no finished sessions registered.")
+        else:
+            print(f"Removed {len(finished)} finished session(s): {', '.join(i.id for i in finished)}")
         return 0
 
     return 1  # argparse's required=True on the subparser makes this unreachable
@@ -852,6 +977,7 @@ def main(argv=None) -> int:
             return 1
 
         intake = intake_mission(ui, client, cfg, raw_mission, skip_prompts=args.yes)
+        _drain_stdin()  # enhance_mission just blocked on a network call too -- see _drain_stdin
         mission, slug = intake.mission, intake.slug
         ui.print_mission(mission)
 
@@ -871,6 +997,7 @@ def main(argv=None) -> int:
                     ui.print_error("Empty mission, nothing to do.")
                     return 1
                 intake = intake_mission(ui, client, cfg, raw_mission, skip_prompts=False)
+                _drain_stdin()
                 mission, slug = intake.mission, intake.slug
                 ui.print_mission(mission)
                 continue

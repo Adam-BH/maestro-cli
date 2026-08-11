@@ -201,6 +201,23 @@ class MaestroUI:
         if self._live is not None:
             self._live.update(self._render())
 
+    def refresh(self) -> None:
+        """Public entry point for a caller that mutates state this render
+        depends on (e.g. `attach_strategy`) without going through one of
+        the state-update methods above, which already refresh on their
+        own -- `maestro sessions attach` polling STRATEGY.md is the
+        motivating case, see main.py."""
+        self._refresh()
+
+    def live_console(self) -> Console:
+        """Same routing `log()` uses internally: the Live region's own
+        console when one is active (required so prints interleave with the
+        live redraw instead of corrupting it), otherwise the plain
+        console. Exposed for callers outside this module that need to
+        print pre-rendered text alongside a live view -- see
+        `maestro sessions attach` in main.py."""
+        return self._live.console if self._live is not None else self.console
+
     def stop_live(self) -> None:
         """Temporarily stop the Live region so a plain `input()` prompt (or
         a one-off panel that needs full scrollback) can be shown cleanly."""
