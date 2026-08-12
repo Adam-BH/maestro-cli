@@ -109,11 +109,29 @@ class Loop:
         # isn't ready to commit yet. Scoped to this one path (see
         # commit_paths) so it never sweeps up unrelated dirty/staged files.
         if not self.strategy.no_commit:
-            git_utils.commit_paths(
+            self._safe_commit_paths(
                 [self.config.strategy_path],
                 f"[checkpoint] STRATEGY.md — iteration {self.strategy.iteration}",
-                cwd=self.cwd,
             )
+
+    def _safe_commit_paths(self, paths: List[str], message: str) -> Optional[str]:
+        """Same as git_utils.commit_paths, but never lets a git-level failure
+        (dirty index race, path that turned out not to exist, ...) crash the
+        run — every one of these commits is a nicety on top of already-real
+        progress, not something correctness depends on."""
+        try:
+            return git_utils.commit_paths(paths, message, cwd=self.cwd)
+        except git_utils.GitError as e:
+            self.strategy.add_log("system", f"Commit failed (non-fatal): {e}")
+            return None
+
+    def _safe_commit_all(self, message: str) -> Optional[str]:
+        """See _safe_commit_paths."""
+        try:
+            return git_utils.commit_all(message, cwd=self.cwd)
+        except git_utils.GitError as e:
+            self.strategy.add_log("system", f"Commit failed (non-fatal): {e}")
+            return None
 
     # -- skill generation ----------------------------------------------
 
@@ -137,8 +155,18 @@ class Loop:
             return
 
         skill_path = f".claude/skills/{slug}/SKILL.md"
+        # result.ok only means the `claude -p` invocation itself succeeded —
+        # it says nothing about whether the agent actually wrote the file it
+        # was told to. Check before committing rather than letting `git add`
+        # on a nonexistent path blow up the whole run.
+        if not (Path(self.cwd) / skill_path).exists():
+            self.strategy.add_log(
+                "system",
+                f"Skill generation reported success but {skill_path} was not found on disk; skipping.",
+            )
+            return
         if not self.strategy.no_commit:
-            git_utils.commit_paths([skill_path], f"Add SKILL.md for {slug}", cwd=self.cwd)
+            self._safe_commit_paths([skill_path], f"Add SKILL.md for {slug}")
         self.strategy.add_log("system", f"Generated {skill_path}.")
 
     # -- live activity streaming --------------------------------------
@@ -425,8 +453,8 @@ class Loop:
                 self.strategy.add_log(producer.name, f"{task.id} attempt {task.attempts}: {summary}")
 
                 if self.config.commit_every_attempt and not self.strategy.no_commit:
-                    sha = git_utils.commit_all(
-                        f"[checkpoint] {task.id} attempt {task.attempts}", cwd=self.cwd
+                    sha = self._safe_commit_all(
+                        f"[checkpoint] {task.id} attempt {task.attempts}"
                     )
                     if sha:
                         self.commits.append((sha, f"[checkpoint] {task.id} attempt {task.attempts}"))
@@ -488,7 +516,7 @@ class Loop:
                 task.last_producer_summary = ""
                 task.review_attempts = 0
                 if not self.strategy.no_commit:
-                    sha = git_utils.commit_all(f"[approved] {task.id}: {task.title}", cwd=self.cwd)
+                    sha = self._safe_commit_all(f"[approved] {task.id}: {task.title}")
                     if sha:
                         self.commits.append((sha, f"[approved] {task.id}: {task.title}"))
                 return OUTCOME_APPROVED, ""

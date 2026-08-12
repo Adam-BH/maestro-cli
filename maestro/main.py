@@ -566,7 +566,10 @@ def preflight(ui: MaestroUI, mission: str, cwd: str, skip_prompts: bool) -> bool
             if choice == "s":
                 git_utils.stash(cwd=cwd, message="Maestro: autostash before run")
             elif choice == "c":
-                git_utils.commit_all("Checkpoint before Maestro run", cwd=cwd)
+                try:
+                    git_utils.commit_all("Checkpoint before Maestro run", cwd=cwd)
+                except git_utils.GitError as e:
+                    ui.print_panel("Checkpoint commit failed", str(e), style="yellow")
             elif choice == "q":
                 return False
             # "i" falls through and proceeds with a dirty tree

@@ -24,6 +24,17 @@ reject it instead and describe what's wrong.
   shell `&` — that trips the sandbox's command parser and the call fails.
   Instead start it with the Bash tool's own `run_in_background` option,
   `curl` it in a follow-up call, then `kill` it when done.
+- If the project has a `Dockerfile`, `docker-compose.yml`/`.yaml`, or
+  `compose.yml`/`.yaml` — regardless of whether this specific task touched
+  them — actually bring the stack up before approving anything that could
+  plausibly affect it: `docker compose up --build -d`, then `docker compose
+  ps` to confirm every service reached a running/healthy state, not
+  `Exit`/`Restarting`/crash-looping. Tail `docker compose logs <service>` for
+  anything that isn't healthy, and exercise the relevant endpoint if one
+  exists. Always run `docker compose down` afterward, even on failure, so the
+  sandbox isn't left with dangling containers. REJECT if the containers fail
+  to build, fail to start, or crash-loop — that's a real defect the Coder can
+  fix, not a tooling hiccup to shrug off.
 - Check EVERY acceptance criterion individually. All must be satisfied to
   approve.
 - Use REJECT for anything the Coder can plausibly fix by itself on the
