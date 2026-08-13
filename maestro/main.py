@@ -21,9 +21,11 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+from prompt_toolkit.completion import PathCompleter
 from rich import box
 from rich.table import Table
 from rich.text import Text
@@ -33,6 +35,7 @@ from maestro import git_utils, scheduler, sessions
 from maestro.claude_client import ClaudeCLINotFound, is_auth_error
 from maestro.loop import Loop
 from maestro.strategy import Strategy
+from maestro.ui import input as ui_input
 from maestro.ui.console import MaestroUI
 
 
@@ -252,44 +255,13 @@ def build_config(args: argparse.Namespace):
 
 # -- mission intake --------------------------------------------------
 
-def _drain_stdin() -> None:
-    """Discards whatever's sitting unread in the terminal's input buffer.
-    Called right before an input() prompt that follows a blocking network
-    call (clarify_mission/enhance_mission) — those calls give no visual
-    feedback of their own turnaround time, so a user who thinks the CLI
-    has hung tends to mash Enter (or Shift-Enter, which most terminals
-    turn into a plain newline) while waiting. Without this, every one of
-    those buffered newlines gets silently consumed by the next input()
-    call in sequence, which reads as clarifying questions being skipped
-    entirely rather than actually asked. Best-effort: only works on a real
-    POSIX tty, and it's fine to no-op anywhere else (Windows, piped
-    stdin) since there's nothing queued to drain in those cases anyway."""
-    try:
-        import termios
-    except ImportError:
-        return  # not POSIX (e.g. Windows) -- nothing to drain the same way
-    try:
-        if sys.stdin.isatty():
-            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
-    except (termios.error, ValueError, OSError):
-        pass
-
-
 def prompt_mission(ui: MaestroUI) -> str:
     ui.console.print(
         "[bold cyan]Maestro[/bold cyan] — describe the mission "
-        "(what should be built/fixed/changed). Finish with an empty line.\n"
+        "(what should be built/fixed/changed). Multiple lines OK — "
+        "press Esc then Enter (or Alt+Enter) to submit.\n"
     )
-    lines = []
-    while True:
-        try:
-            line = input()
-        except EOFError:
-            break
-        if line == "" and lines:
-            break
-        lines.append(line)
-    return "\n".join(lines).strip()
+    return ui_input.ask_text(ui, "> ", multiline=True)
 
 
 @dataclass
@@ -354,22 +326,17 @@ def ask_clarifying_questions(ui: MaestroUI, questions: List[ClarifyQuestion]) ->
     text before it goes to enhance_mission.
 
     Each question gets its own panel plus an explicit "Got it" echo of
-    what was captured before moving to the next one -- a bare input()
-    loop gives no feedback that an answer actually registered, which is
-    exactly the kind of silence that made the earlier shift-enter-mashing
-    problem this session (see _drain_stdin) hard to notice was happening
-    at all. A summary panel at the end gives one last checkpoint before
-    the answers get folded into the mission text."""
+    what was captured before moving to the next one, so an answer
+    registering is never silent. A summary panel at the end gives one
+    last checkpoint before the answers get folded into the mission text."""
     if not questions:
         return []
-    _drain_stdin()  # clarify_mission just blocked on a network call -- see _drain_stdin
     ui.console.print("\n[bold cyan]A few quick questions before I write this up:[/bold cyan]\n")
     total = len(questions)
     answers = []
     for i, q in enumerate(questions, start=1):
         ui.print_panel(f"Question {i} of {total}", q.question, style="cyan")
-        raw = input(f"  [{q.default}]: ").strip()
-        answer = raw or q.default
+        answer = ui_input.ask_text(ui, f"  [{q.default}]: ", default=q.default)
         answers.append((q.question, answer))
         ui.console.print(f"  [green]✓ Got it:[/green] {answer}\n")
 
@@ -471,6 +438,9 @@ def default_project_slug(mission: str) -> str:
     return slug or "project"
 
 
+_PATH_COMPLETER = PathCompleter(expanduser=True)
+
+
 def choose_project_dir(
     ui: MaestroUI, mission: str, args: argparse.Namespace, suggested_slug: Optional[str] = None
 ) -> str:
@@ -495,8 +465,8 @@ def choose_project_dir(
             "\n[bold]Where should this project live?[/bold] "
             "(created automatically if it doesn't exist)"
         )
-        raw = input(f"Path [{default}]: ").strip()
-        candidate = Path(raw).expanduser().resolve() if raw else default
+        raw = ui_input.ask_text(ui, f"Path [{default}]: ", default=str(default), completer=_PATH_COMPLETER)
+        candidate = Path(raw).expanduser().resolve()
 
     while is_maestro_source(candidate):
         ui.print_error(
@@ -507,8 +477,8 @@ def choose_project_dir(
         if args.yes or args.dir:
             sys.exit(1)
         default = Path.home() / "Desktop" / slug
-        raw = input(f"Path [{default}]: ").strip()
-        candidate = Path(raw).expanduser().resolve() if raw else default
+        raw = ui_input.ask_text(ui, f"Path [{default}]: ", default=str(default), completer=_PATH_COMPLETER)
+        candidate = Path(raw).expanduser().resolve()
 
     candidate.mkdir(parents=True, exist_ok=True)
     return str(candidate)
@@ -541,7 +511,8 @@ def preflight(ui: MaestroUI, mission: str, cwd: str, skip_prompts: bool) -> bool
         if skip_prompts:
             do_init = True
         else:
-            do_init = input("Run `git init` now? [Y/n]: ").strip().lower() not in ("n", "no")
+            choice = ui_input.ask_choice(ui, "Run `git init` now? [Y/n]: ", {"y": "Yes", "n": "No"}, default="y")
+            do_init = choice == "y"
         if do_init:
             import subprocess
 
@@ -562,7 +533,12 @@ def preflight(ui: MaestroUI, mission: str, cwd: str, skip_prompts: bool) -> bool
             git_utils.stash(cwd=cwd, message="Maestro: autostash before run")
             ui.print_panel("Stashed", "Existing changes stashed automatically (--yes).", style="yellow")
         else:
-            choice = input("[s]tash them, [c]ommit them, [i]gnore, or [q]uit? ").strip().lower()
+            choice = ui_input.ask_choice(
+                ui,
+                "[s]tash them, [c]ommit them, [i]gnore, or [q]uit? ",
+                {"s": "stash", "c": "commit", "i": "ignore", "q": "quit"},
+                default="i",
+            )
             if choice == "s":
                 git_utils.stash(cwd=cwd, message="Maestro: autostash before run")
             elif choice == "c":
@@ -1105,10 +1081,15 @@ def _handle_blocked_end(ui: MaestroUI, loop: Loop) -> str:
             "\n\n".join(f"{t.id}: {t.title}\n{t.notes}" for t in blocked),
             style="bold red",
         )
-        guidance = input(
+        guidance = ui_input.ask_text(
+            ui,
             "\nType guidance to unblock these and keep going now, "
-            "or press Enter to leave the run parked and exit: "
-        ).strip()
+            "or press Enter to leave the run parked and exit: ",
+            on_status=lambda: ui.console.print(
+                f"{loop.strategy.progress()[0]}/{loop.strategy.progress()[1]} tasks done, "
+                f"status={loop.strategy.run_status}"
+            ),
+        )
         if not guidance:
             return loop.strategy.run_status
 
@@ -1160,6 +1141,14 @@ def ensure_authenticated(ui: MaestroUI, client) -> bool:
 # -- main --------------------------------------------------------------
 
 def main(argv=None) -> int:
+    try:
+        return _main_impl(argv)
+    except ui_input.InputAborted:
+        print("\nAborted (/quit). Progress up to this point, if any, is saved in STRATEGY.md.")
+        return 0
+
+
+def _main_impl(argv=None) -> int:
     args = parse_args(argv)
 
     if args.command == "update":
@@ -1200,7 +1189,47 @@ def main(argv=None) -> int:
             style="yellow",
         )
 
-    if args.resume:
+    effective_resume = args.resume
+    if not args.resume and args.dir:
+        # Starting a *new* mission with --dir pointed at a directory that
+        # already has a STRATEGY.md from a prior run: without this check
+        # the fresh Strategy built below would silently overwrite it.
+        # choose_project_dir()'s own new-project-flavored default naming
+        # never hits this — it only applies when --dir was explicitly given.
+        candidate_dir = str(Path(args.dir).expanduser().resolve())
+        stale_path = Path(candidate_dir) / cfg.strategy_path
+        if stale_path.exists():
+            old = Strategy.load(str(stale_path))
+            done, total = old.progress()
+            if args.yes or not sys.stdin.isatty():
+                # Never destructive without a human present: default to
+                # resuming rather than silently overwriting.
+                ui.console.print(
+                    f"[yellow]Existing {cfg.strategy_path} found in {candidate_dir} -- "
+                    "auto-resuming it (--yes). Pass --resume explicitly to silence this.[/yellow]"
+                )
+                effective_resume = True
+            else:
+                choice = ui_input.ask_choice(
+                    ui,
+                    f"Found an existing mission in {candidate_dir}:\n\n"
+                    f"\"{old.mission[:200]}\"\n\n{done}/{total} tasks done, status={old.run_status}\n\n"
+                    "[r]esume it / [a]rchive it and start a new mission / [q]uit: ",
+                    {"r": "resume it", "a": "archive it and start a new mission", "q": "abort"},
+                    default="r",
+                )
+                if choice == "q":
+                    ui.console.print("Aborted.")
+                    return 0
+                if choice == "r":
+                    effective_resume = True
+                else:
+                    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    archived = stale_path.with_name(f"{stale_path.stem}.{stamp}.bak{stale_path.suffix}")
+                    stale_path.rename(archived)
+                    ui.console.print(f"[cyan]Archived old mission to {archived.name}[/cyan]")
+
+    if effective_resume:
         target_dir = str(Path(args.dir).expanduser().resolve()) if args.dir else str(Path.cwd())
         os.chdir(target_dir)
         if not Path(cfg.strategy_path).exists():
@@ -1244,7 +1273,6 @@ def main(argv=None) -> int:
             return 1
 
         intake = intake_mission(ui, client, cfg, raw_mission, skip_prompts=args.yes)
-        _drain_stdin()  # enhance_mission just blocked on a network call too -- see _drain_stdin
         mission, slug = intake.mission, intake.slug
         ui.print_mission(mission)
 
@@ -1252,23 +1280,27 @@ def main(argv=None) -> int:
 
         while not args.yes:
             ui.console.print(f"[bold]Folder:[/bold] {target_dir}\n")
-            choice = input("Start here? [Y]es / [e]dit mission / [f]older / [q]uit: ").strip().lower()
-            if choice in ("", "y", "yes"):
+            choice = ui_input.ask_choice(
+                ui,
+                "Start here? [Y]es / [e]dit mission / [f]older / [q]uit: ",
+                {"y": "Yes", "e": "edit mission", "f": "folder", "q": "quit"},
+                default="y",
+            )
+            if choice == "y":
                 break
-            if choice in ("q", "quit"):
+            if choice == "q":
                 ui.console.print("Aborted.")
                 return 0
-            if choice in ("e", "edit"):
+            if choice == "e":
                 raw_mission = prompt_mission(ui)
                 if not raw_mission:
                     ui.print_error("Empty mission, nothing to do.")
                     return 1
                 intake = intake_mission(ui, client, cfg, raw_mission, skip_prompts=False)
-                _drain_stdin()
                 mission, slug = intake.mission, intake.slug
                 ui.print_mission(mission)
                 continue
-            if choice in ("f", "folder"):
+            if choice == "f":
                 args.dir = None  # force an interactive re-prompt even if --dir was passed
                 target_dir = choose_project_dir(ui, mission, args, suggested_slug=slug)
                 continue
@@ -1355,15 +1387,14 @@ def main(argv=None) -> int:
 def _handle_pause(ui: MaestroUI, task_id: str, reason: str) -> bool:
     """Interactive NEEDS_HUMAN handler used by main(). Returns True to
     retry the paused task, False to stop the run."""
-    ui.stop_live()
-    try:
-        choice = input(
-            f"\nTask {task_id} needs human input:\n{reason}\n\n"
-            "Fix whatever's needed in the repo, then choose: "
-            "[r]etry this task / [q]uit and keep progress: "
-        ).strip().lower()
-    finally:
-        ui.resume_live()
+    choice = ui_input.ask_choice(
+        ui,
+        f"\nTask {task_id} needs human input:\n{reason}\n\n"
+        "Fix whatever's needed in the repo, then choose: "
+        "[r]etry this task / [q]uit and keep progress: ",
+        {"r": "retry", "q": "quit"},
+        default="q",
+    )
     return choice == "r"
 
 

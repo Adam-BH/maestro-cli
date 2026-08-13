@@ -245,7 +245,9 @@ intake below runs — nothing is wasted figuring this out the hard way.
 
 ### Mission intake
 
-1. You type a free-text mission (typos and all), finished with an empty line.
+1. You type a free-text mission (typos and all) in a multiline box — press
+   Esc then Enter (or Alt+Enter) to submit. Up/down recall prior entries;
+   `/quit` aborts.
 2. A one-shot `claude -p` call (`agents/prompts/mission_clarifier.md`, no
    tools, tiny turn budget) looks for anything genuinely ambiguous about
    *this* mission — target platform, must-have vs. nice-to-have scope,

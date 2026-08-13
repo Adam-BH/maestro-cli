@@ -5,6 +5,7 @@ description = "Orchestrates Planner/Coder/Researcher/Tester/Reviewer Claude Code
 requires-python = ">=3.9"
 dependencies = [
     "rich>=13.7",
+    "prompt_toolkit>=3.0",
 ]
 
 [project.scripts]

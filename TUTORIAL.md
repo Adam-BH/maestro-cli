@@ -29,11 +29,13 @@ maestro run
 You'll see the banner, then:
 
 ```
-Maestro — describe the mission (what should be built/fixed/changed). Finish with
-an empty line.
+Maestro — describe the mission (what should be built/fixed/changed). Multiple
+lines OK — press Esc then Enter (or Alt+Enter) to submit.
 ```
 
-Type your mission, then an empty line to finish. What happens next, in order:
+Type your mission (multiple lines OK — Enter just adds a new line), then press
+Esc then Enter (or Alt+Enter) to submit. Up/down recall prior entries; `/quit`
+aborts. What happens next, in order:
 
 1. **Clarifying questions** — if your mission leaves something genuinely
    open (platform? persistence? auth?), you'll get up to 5 short questions,
